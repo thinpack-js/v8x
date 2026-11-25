@@ -214,12 +214,12 @@ pub extern "C" fn v8__String__Utf8Length(
       return 0;
     }
 
-    let cap = JSStringGetMaximumUTF8CStringSize(s);
-    let mut buf: Vec<u8> = vec![0; cap];
-    let written = JSStringGetUTF8CString(s, buf.as_mut_ptr() as *mut char, cap);
+    let Some(units) = utf16_units(s) else {
+      JSStringRelease(s);
+      return 0;
+    };
     JSStringRelease(s);
-
-    (written.saturating_sub(1)) as int
+    utf8_length(&units) as int
   }
 }
 
@@ -322,27 +322,94 @@ pub extern "C" fn v8__String__WriteOneByte_v2(
   }
 }
 
-fn utf8_complete_prefix(s: &[u8], cap: usize) -> (usize, size_t) {
+/// UTF-16 code units of a string. JSC keeps 8-bit strings without a UTF-16
+/// buffer, so those are widened from their UTF-8 form.
+fn utf16_units(s: JSStringRef) -> Option<Vec<u16>> {
+  let len = unsafe { JSStringGetLength(s) };
+  if len == 0 {
+    return Some(Vec::new());
+  }
+  let chars = unsafe { JSStringGetCharactersPtr(s) };
+  if !chars.is_null() {
+    return Some(unsafe { std::slice::from_raw_parts(chars, len) }.to_vec());
+  }
+  let cap = unsafe { JSStringGetMaximumUTF8CStringSize(s) };
+  let mut buf = vec![0u8; cap];
+  let written =
+    unsafe { JSStringGetUTF8CString(s, buf.as_mut_ptr() as *mut char, cap) };
+  if written == 0 {
+    return None;
+  }
+  let text = std::str::from_utf8(&buf[..written - 1]).ok()?;
+  Some(text.encode_utf16().collect())
+}
+
+fn utf8_length(units: &[u16]) -> usize {
+  let mut len = 0usize;
   let mut i = 0usize;
-  let mut units: size_t = 0;
-  while i < s.len() {
-    let b = s[i];
-    let seq = if b < 0x80 {
-      1
-    } else if b < 0xE0 {
-      2
-    } else if b < 0xF0 {
-      3
-    } else {
-      4
-    };
-    if i + seq > cap {
+  while i < units.len() {
+    let (code_point, width) = decode_utf16(units, i);
+    len += utf8_width(code_point);
+    i += width;
+  }
+  len
+}
+
+/// Decodes one UTF-16 unit pair, replacing an unpaired surrogate with U+FFFD.
+fn decode_utf16(units: &[u16], index: usize) -> (u32, usize) {
+  let unit = units[index];
+  if (0xD800..=0xDBFF).contains(&unit)
+    && index + 1 < units.len()
+    && (0xDC00..=0xDFFF).contains(&units[index + 1])
+  {
+    let high = u32::from(unit - 0xD800);
+    let low = u32::from(units[index + 1] - 0xDC00);
+    (0x10000 + (high << 10) + low, 2)
+  } else if (0xD800..=0xDFFF).contains(&unit) {
+    (0xFFFD, 1)
+  } else {
+    (u32::from(unit), 1)
+  }
+}
+
+const fn utf8_width(code_point: u32) -> usize {
+  if code_point < 0x80 {
+    1
+  } else if code_point < 0x800 {
+    2
+  } else if code_point < 0x10000 {
+    3
+  } else {
+    4
+  }
+}
+
+/// Encodes `units` into `out`, stopping before a character that would not fit.
+/// Returns `(bytes written, UTF-16 units consumed)`.
+fn write_utf8(units: &[u16], out: &mut [u8]) -> (usize, usize) {
+  let mut written = 0usize;
+  let mut i = 0usize;
+  while i < units.len() {
+    let (code_point, width) = decode_utf16(units, i);
+    let bytes = utf8_width(code_point);
+    if written + bytes > out.len() {
       break;
     }
-    units += if seq == 4 { 2 } else { 1 };
-    i += seq;
+    let (first, count) = match bytes {
+      1 => (code_point, 0),
+      2 => (0xC0 | (code_point >> 6), 1),
+      3 => (0xE0 | (code_point >> 12), 2),
+      _ => (0xF0 | (code_point >> 18), 3),
+    };
+    out[written] = first as u8;
+    for offset in 1..=count {
+      let shift = 6 * (count - offset);
+      out[written + offset] = (0x80 | ((code_point >> shift) & 0x3F)) as u8;
+    }
+    written += bytes;
+    i += width;
   }
-  (i, units)
+  (written, i)
 }
 
 #[unsafe(no_mangle)]
@@ -369,32 +436,25 @@ pub extern "C" fn v8__String__WriteUtf8_v2(
       }
       return 0;
     }
-    let char_count = JSStringGetLength(s);
-
-    let max = JSStringGetMaximumUTF8CStringSize(s);
-    let mut scratch: Vec<u8> = vec![0; max];
-    let written =
-      JSStringGetUTF8CString(s, scratch.as_mut_ptr() as *mut char, max);
+    let Some(units) = utf16_units(s) else {
+      JSStringRelease(s);
+      if !processed_characters_return.is_null() {
+        *processed_characters_return = 0;
+      }
+      return 0;
+    };
     JSStringRelease(s);
 
-    let utf8_len = written.saturating_sub(1);
+    let out = std::slice::from_raw_parts_mut(buffer as *mut u8, capacity);
+    let (written, consumed) = write_utf8(&units, out);
 
-    let (copy, units) = if utf8_len <= capacity {
-      (utf8_len, char_count)
-    } else {
-      utf8_complete_prefix(&scratch[..utf8_len], capacity)
-    };
-    if copy > 0 {
-      ptr::copy_nonoverlapping(scratch.as_ptr(), buffer as *mut u8, copy);
-    }
-
-    if copy < capacity {
-      *(buffer as *mut u8).add(copy) = 0;
+    if flags & 1 != 0 && written < capacity {
+      out[written] = 0;
     }
     if !processed_characters_return.is_null() {
-      *processed_characters_return = units;
+      *processed_characters_return = consumed;
     }
-    copy as int
+    written as int
   }
 }
 

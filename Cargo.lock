@@ -617,6 +617,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "thinpack-jsc-rewrite"
+version = "0.2.0"
+
+[[package]]
 name = "timezone_provider"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -671,6 +675,7 @@ dependencies = [
  "paste",
  "temporal_capi",
  "temporal_rs",
+ "thinpack-jsc-rewrite",
  "timezone_provider",
 ]
 

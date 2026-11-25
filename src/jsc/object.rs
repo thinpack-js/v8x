@@ -357,10 +357,10 @@ pub extern "C" fn v8__Object__GetOwnPropertyNames(
   this: *const Object,
   context: *const Context,
   filter: PropertyFilter,
-  key_conversion: KeyConversionMode,
+  _key_conversion: KeyConversionMode,
 ) -> *const Array {
-  let _ = (filter, key_conversion);
-  property_names_array(this, context, false)
+  let filter = unsafe { *(&filter as *const PropertyFilter as *const u32) };
+  property_names_array_own(this, context, filter, false)
 }
 
 #[unsafe(no_mangle)]
@@ -370,19 +370,307 @@ pub extern "C" fn v8__Object__GetPropertyNames(
   mode: KeyCollectionMode,
   property_filter: PropertyFilter,
   index_filter: IndexFilter,
-  key_conversion: KeyConversionMode,
+  _key_conversion: KeyConversionMode,
 ) -> *const Array {
-  let _ = (mode, key_conversion);
-
   let filter =
     unsafe { *(&property_filter as *const PropertyFilter as *const u32) };
+  let skip_indices = index_filter as u32 == 1;
 
+  if matches!(mode, KeyCollectionMode::OwnOnly) {
+    return property_names_array_own(this, context, filter, skip_indices);
+  }
+
+  // `JSObjectCopyPropertyNames` walks the prototype chain and only sees
+  // enumerable names; that is the shape this fallback has always had.
   if filter & 8 != 0 {
     return empty_array(this, context);
   }
-
-  let skip_indices = index_filter as u32 == 1;
   property_names_array(this, context, skip_indices)
+}
+
+/// Own property names, honoring V8's `PropertyFilter`.
+///
+/// JSC's public C API has no own-only enumeration: `JSObjectCopyPropertyNames`
+/// returns enumerable names including inherited ones. The standard builtins
+/// (`Object.getOwnPropertyNames`, `getOwnPropertyDescriptor`,
+/// `getOwnPropertySymbols`) provide the own-name list and the descriptor flags.
+fn property_names_array_own(
+  this: *const Object,
+  context: *const Context,
+  filter: u32,
+  skip_indices: bool,
+) -> *const Array {
+  let ctx = ctx_of(context) as JSContextRef;
+  let object = obj_of(ctx, this);
+  if ctx.is_null() || object.is_null() {
+    return ptr::null();
+  }
+
+  unsafe {
+    let global = JSContextGetGlobalObject(ctx);
+    let Some(object_ctor_value) = named_value(ctx, global, c"Object") else {
+      return ptr::null();
+    };
+    if !JSValueIsObject(ctx, object_ctor_value) {
+      return ptr::null();
+    }
+    let object_ctor = object_ctor_value as JSObjectRef;
+
+    let Some(get_own_names) =
+      named_function(ctx, object_ctor, c"getOwnPropertyNames")
+    else {
+      return ptr::null();
+    };
+
+    let enumerable = if filter & 2 != 0 {
+      let Some(prototype) = named_value(ctx, object_ctor, c"prototype") else {
+        return ptr::null();
+      };
+      let Some(function) =
+        named_function(ctx, prototype as JSObjectRef, c"propertyIsEnumerable")
+      else {
+        return ptr::null();
+      };
+      Some(function)
+    } else {
+      None
+    };
+
+    let descriptor = if filter & (1 | 4) != 0 {
+      let Some(function) =
+        named_function(ctx, object_ctor, c"getOwnPropertyDescriptor")
+      else {
+        return ptr::null();
+      };
+      Some(function)
+    } else {
+      None
+    };
+
+    let mut values = Vec::new();
+    let Some(names) =
+      call_function(ctx, get_own_names, object_ctor, &[object as JSValueRef])
+    else {
+      return ptr::null();
+    };
+    if !append_property_names(
+      ctx,
+      names,
+      object,
+      filter,
+      skip_indices,
+      enumerable,
+      descriptor,
+      object_ctor,
+      &mut values,
+    ) {
+      return ptr::null();
+    }
+
+    if filter & 16 == 0 {
+      let Some(get_own_symbols) =
+        named_function(ctx, object_ctor, c"getOwnPropertySymbols")
+      else {
+        return ptr::null();
+      };
+      let Some(symbols) = call_function(
+        ctx,
+        get_own_symbols,
+        object_ctor,
+        &[object as JSValueRef],
+      ) else {
+        return ptr::null();
+      };
+      if !append_property_names(
+        ctx,
+        symbols,
+        object,
+        filter,
+        false,
+        enumerable,
+        descriptor,
+        object_ctor,
+        &mut values,
+      ) {
+        return ptr::null();
+      }
+    }
+
+    let mut exc: JSValueRef = ptr::null();
+    let array = JSObjectMakeArray(ctx, values.len(), values.as_ptr(), &mut exc);
+    if !exc.is_null() || array.is_null() {
+      return ptr::null();
+    }
+    intern_ctx::<Array>(ctx, array as JSValueRef)
+  }
+}
+
+unsafe fn named_value(
+  ctx: JSContextRef,
+  object: JSObjectRef,
+  name: &std::ffi::CStr,
+) -> Option<JSValueRef> {
+  let key = unsafe { JSStringCreateWithUTF8CString(name.as_ptr()) };
+  let mut exc: JSValueRef = ptr::null();
+  let value = unsafe { JSObjectGetProperty(ctx, object, key, &mut exc) };
+  unsafe { JSStringRelease(key) };
+  if !exc.is_null()
+    || value.is_null()
+    || unsafe { JSValueIsUndefined(ctx, value) }
+  {
+    None
+  } else {
+    Some(value)
+  }
+}
+
+unsafe fn named_function(
+  ctx: JSContextRef,
+  object: JSObjectRef,
+  name: &std::ffi::CStr,
+) -> Option<JSObjectRef> {
+  let value = unsafe { named_value(ctx, object, name) }?;
+  if unsafe { JSValueIsObject(ctx, value) }
+    && unsafe { JSObjectIsFunction(ctx, value as JSObjectRef) }
+  {
+    Some(value as JSObjectRef)
+  } else {
+    None
+  }
+}
+
+unsafe fn call_function(
+  ctx: JSContextRef,
+  function: JSObjectRef,
+  this: JSObjectRef,
+  args: &[JSValueRef],
+) -> Option<JSValueRef> {
+  let mut exc: JSValueRef = ptr::null();
+  let value = unsafe {
+    JSObjectCallAsFunction(
+      ctx,
+      function,
+      this,
+      args.len(),
+      args.as_ptr(),
+      &mut exc,
+    )
+  };
+  if !exc.is_null() || value.is_null() {
+    None
+  } else {
+    Some(value)
+  }
+}
+
+unsafe fn array_length(ctx: JSContextRef, array: JSValueRef) -> Option<u32> {
+  let length = unsafe { named_value(ctx, array as JSObjectRef, c"length") }?;
+  let mut exc: JSValueRef = ptr::null();
+  let length = unsafe { JSValueToNumber(ctx, length, &mut exc) };
+  if !exc.is_null()
+    || !length.is_finite()
+    || !(0.0..=(u32::MAX as f64)).contains(&length)
+  {
+    None
+  } else {
+    Some(length as u32)
+  }
+}
+
+unsafe fn bool_property(
+  ctx: JSContextRef,
+  object: JSObjectRef,
+  name: &std::ffi::CStr,
+) -> bool {
+  unsafe { named_value(ctx, object, name) }
+    .is_some_and(|value| unsafe { JSValueToBoolean(ctx, value) })
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn append_property_names(
+  ctx: JSContextRef,
+  names: JSValueRef,
+  object: JSObjectRef,
+  filter: u32,
+  skip_indices: bool,
+  enumerable: Option<JSObjectRef>,
+  descriptor: Option<JSObjectRef>,
+  object_ctor: JSObjectRef,
+  values: &mut Vec<JSValueRef>,
+) -> bool {
+  let Some(length) = (unsafe { array_length(ctx, names) }) else {
+    return false;
+  };
+  for index in 0..length {
+    let mut exc: JSValueRef = ptr::null();
+    let name = unsafe {
+      JSObjectGetPropertyAtIndex(ctx, names as JSObjectRef, index, &mut exc)
+    };
+    if !exc.is_null() || name.is_null() {
+      return false;
+    }
+
+    let is_string = unsafe { JSValueIsString(ctx, name) };
+    if is_string {
+      if filter & 8 != 0 {
+        continue;
+      }
+      if skip_indices {
+        let mut exc: JSValueRef = ptr::null();
+        let text = unsafe { JSValueToStringCopy(ctx, name, &mut exc) };
+        if !exc.is_null() || text.is_null() {
+          return false;
+        }
+        let is_index = unsafe { jsstr_is_array_index(text) };
+        unsafe { JSStringRelease(text) };
+        if is_index {
+          continue;
+        }
+      }
+    } else if filter & 16 != 0 {
+      continue;
+    }
+
+    if let Some(function) = enumerable {
+      let Some(result) =
+        (unsafe { call_function(ctx, function, object, &[name]) })
+      else {
+        return false;
+      };
+      if !unsafe { JSValueToBoolean(ctx, result) } {
+        continue;
+      }
+    }
+
+    if let Some(function) = descriptor {
+      let args = [object as JSValueRef, name];
+      let Some(descriptor) =
+        (unsafe { call_function(ctx, function, object_ctor, &args) })
+      else {
+        return false;
+      };
+      if unsafe { JSValueIsUndefined(ctx, descriptor) } {
+        continue;
+      }
+      if filter & 1 != 0
+        && !unsafe {
+          bool_property(ctx, descriptor as JSObjectRef, c"writable")
+        }
+      {
+        continue;
+      }
+      if filter & 4 != 0
+        && !unsafe {
+          bool_property(ctx, descriptor as JSObjectRef, c"configurable")
+        }
+      {
+        continue;
+      }
+    }
+
+    values.push(name);
+  }
+  true
 }
 
 fn property_names_array(
@@ -439,7 +727,14 @@ unsafe fn jsstr_is_array_index(s: JSStringRef) -> bool {
   }
   let chars = unsafe { JSStringGetCharactersPtr(s) };
   if chars.is_null() {
-    return false;
+    // JSC keeps ASCII names in 8-bit strings, which have no UTF-16 buffer.
+    let mut bytes = [0 as c_char; 16];
+    let written =
+      unsafe { JSStringGetUTF8CString(s, bytes.as_mut_ptr(), bytes.len()) };
+    if written == 0 {
+      return false;
+    }
+    return utf8_is_array_index(&bytes[..written - 1]);
   }
   let slice = unsafe { std::slice::from_raw_parts(chars, len) };
 
@@ -454,6 +749,24 @@ unsafe fn jsstr_is_array_index(s: JSStringRef) -> bool {
     val = val * 10 + (c - b'0' as u16) as u64;
   }
   val <= u32::MAX as u64
+}
+
+fn utf8_is_array_index(bytes: &[c_char]) -> bool {
+  if bytes.is_empty() || bytes.len() > 10 {
+    return false;
+  }
+  if bytes[0] as u8 == b'0' {
+    return bytes.len() == 1;
+  }
+  let mut value: u64 = 0;
+  for &byte in bytes {
+    let byte = byte as u8;
+    if !byte.is_ascii_digit() {
+      return false;
+    }
+    value = value * 10 + u64::from(byte - b'0');
+  }
+  value <= u64::from(u32::MAX)
 }
 
 #[unsafe(no_mangle)]

@@ -1,0 +1,14 @@
+# Thinpack's token-aware ES module rewriter for the system-JavaScriptCore shim.
+#
+# It lives inside this fork because the shim is its only consumer: the v8x crate
+# ships the rewriter as a path dependency, and a published crate cannot reach a
+# path outside its own source tree. Standalone manifest on purpose — this package
+# is not a member of any other workspace.
+[package]
+name = "thinpack-jsc-rewrite"
+description = "Token-aware ES module rewriting for the system-JavaScriptCore backend"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/thinpack-js/v8x"
+publish = false

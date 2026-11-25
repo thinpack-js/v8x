@@ -38,6 +38,8 @@ pub extern "C" fn v8__V8__InitializePlatform(_platform: *mut Platform) {
   //   The DFG/baseline tiers keep the safe-point, so dropping just FTL makes such
   //   loops terminable while staying fast. (Allocating loops already hit GC
   //   safe-points.) vendor_jsc only — same stderr rejection as above.
+  // The system-JSC build pushes nothing, so the binding is not mutated there.
+  #[cfg_attr(not(feature = "vendor_jsc"), allow(unused_mut))]
   let mut opts: Vec<(&str, &str)> = vec![("JSC_useSharedArrayBuffer", "1")];
   #[cfg(feature = "vendor_jsc")]
   {

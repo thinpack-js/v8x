@@ -1,5 +1,9 @@
 //! JavaScriptCore engine backend: the v8__* C-ABI implemented over JSC.
-#![allow(non_snake_case)]
+//!
+//! The port mirrors the v8 C ABI verbatim: JSC's generated `kJSType*` constants appear in
+//! patterns, and the `extern "C"` entry points hand private ABI structs across a `pub(crate)`
+//! boundary. Both are properties of the ported ABI, not of this crate's Rust API.
+#![allow(non_snake_case, non_upper_case_globals, private_interfaces)]
 
 pub(crate) mod arraybuffer;
 pub(crate) mod cli_extra;

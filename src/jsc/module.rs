@@ -33,6 +33,10 @@ use crate::script_compiler::{
   CachedData, CompileOptions, NoCacheReason, Source,
 };
 use crate::support::{Maybe, MaybeBool, int};
+use thinpack_jsc_rewrite::{
+  has_top_level_await, import_offsets, rewrite_dynamic_import_calls,
+  rewrite_es_module,
+};
 
 #[repr(C)]
 struct ModJSClassDefinition {
@@ -71,10 +75,23 @@ struct SyntheticModule {
 
   import_specifiers: Vec<std::string::String>,
 
+  // (specifier, imported name, original line) triples for the link check. A
+  // missing named export must fail instantiation, before a dependency runs.
+  import_checks: Vec<(std::string::String, std::string::String, usize)>,
+
+  // A dependency with `export *` has names the rewriter cannot list; skip the
+  // link check for it rather than reject a valid binding.
+  has_star_reexports: bool,
+
   // Byte offset of each import's specifier literal (opening quote) in the
   // original source, parallel to import_specifiers. V8's ModuleRequest
   // source_offset; deno records it as `referrer_source_offset`.
-  import_offsets: Vec<i32>,
+  import_offsets: Vec<usize>,
+
+  // Line start offsets of the original source, so SourceOffsetToLocation can
+  // turn a request's offset back into the line/column deno reports. The rewritten
+  // body loses those positions.
+  source_line_starts: Vec<usize>,
 
   // Import attributes (`with { type: "json", ... }`) per import, parallel to
   // import_specifiers, extracted from source. JSC's record only exposes a coarse
@@ -669,39 +686,6 @@ pub(crate) unsafe fn install_dynamic_import_global(gctx: JSGlobalContextRef) {
     );
     JSStringRelease(name);
   }
-}
-
-/// Rewrite dynamic `import(` call sites to `__v82jsc_dynImport(` (a per-module
-/// closure injected by the caller that forwards to the host bridge with the
-/// module's URL as referrer). Matches the `import` keyword immediately followed
-/// by optional whitespace and `(`, only when not preceded by an identifier char
-/// (so `Reimport(` is left alone). `import.meta` / `import x from` have no `(`
-/// next, so they never match.
-pub(crate) fn rewrite_dynamic_import_calls(body: &str) -> std::string::String {
-  let bytes = body.as_bytes();
-  let mut out: Vec<u8> = Vec::with_capacity(body.len());
-  let mut i = 0;
-  let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
-  while i < bytes.len() {
-    if bytes[i] == b'i'
-      && body[i..].starts_with("import")
-      && (i == 0 || !is_ident(bytes[i - 1]))
-    {
-      // skip whitespace after `import`
-      let mut j = i + 6;
-      while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-        j += 1;
-      }
-      if j < bytes.len() && bytes[j] == b'(' {
-        out.extend_from_slice(b"__v82jsc_dynImport(");
-        i = j + 1;
-        continue;
-      }
-    }
-    out.push(bytes[i]);
-    i += 1;
-  }
-  std::string::String::from_utf8(out).unwrap_or_else(|_| body.to_string())
 }
 
 fn mod_class() -> JSClassRef {
@@ -1367,9 +1351,12 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
           eval_steps: None,
           source: None,
           source_map_url: extract_source_mapping_url(&text),
-          import_offsets: compute_import_offsets(&text, &specs),
+          import_offsets: import_offsets(&text, &specs),
           import_attributes: compute_import_attributes(&text, &specs),
+          source_line_starts: line_starts(&text),
           import_specifiers: specs,
+          import_checks: Vec::new(),
+          has_star_reexports: false,
           namespace: ptr::null_mut(),
           specifier,
           dependencies: Vec::new(),
@@ -1416,6 +1403,12 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
       return ptr::null();
     };
 
+    // The source heuristic misses top-level await inside a block (a `try`, an `if`,
+    // a loop). Parse the synchronous wrapper; a TLA module fails that parse and is
+    // wrapped in an async function instead.
+    let is_async = rewrite.is_async
+      || !sync_wrapper_parses(gctx as JSContextRef, &rewrite.body);
+
     let namespace =
       unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
     unsafe { JSValueProtect(gctx, namespace as JSValueRef) };
@@ -1436,692 +1429,22 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
       eval_steps: None,
       source: Some(rewrite.body),
       source_map_url: extract_source_mapping_url(&text),
-      import_offsets: compute_import_offsets(&text, &rewrite.imports),
+      import_offsets: import_offsets(&text, &rewrite.imports),
       import_attributes: compute_import_attributes(&text, &rewrite.imports),
+      source_line_starts: line_starts(&text),
       import_specifiers: rewrite.imports,
+      import_checks: rewrite.import_checks,
+      has_star_reexports: rewrite.has_star_reexports,
       namespace,
       specifier,
       dependencies: Vec::new(),
-      is_async: rewrite.is_async,
+      is_async,
       native: ptr::null_mut(),
     });
     let obj =
       unsafe { JSObjectMake(ctx, mod_class(), Box::into_raw(state) as *mut _) };
     intern_ctx::<Module>(ctx, obj as JSValueRef)
   }
-}
-
-struct RewrittenModule {
-  body: std::string::String,
-  export_names: Vec<std::string::String>,
-  imports: Vec<std::string::String>,
-  is_async: bool,
-  // (exported, source spec, source local): `export { local as exported } from
-  // spec`. Installed as LIVE getters on the namespace at compile time so a
-  // barrel's re-exports resolve through to the source module even before the
-  // barrel's own body runs (ESM live re-export bindings).
-  reexports: Vec<(
-    std::string::String,
-    std::string::String,
-    std::string::String,
-  )>,
-}
-
-fn strip_js_comments(src: &str) -> std::string::String {
-  let b = src.as_bytes();
-  let n = b.len();
-  let mut out: Vec<u8> = Vec::with_capacity(n);
-  let mut i = 0usize;
-  let mut prev_sig = 0u8;
-  let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
-  while i < n {
-    let c = b[i];
-    match c {
-      b'/' if i + 1 < n && b[i + 1] == b'/' => {
-        i += 2;
-        while i < n && b[i] != b'\n' {
-          i += 1;
-        }
-      }
-      b'/' if i + 1 < n && b[i + 1] == b'*' => {
-        i += 2;
-        while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
-          i += 1;
-        }
-        i += 2;
-      }
-      b'"' | b'\'' => {
-        let q = c;
-        out.push(c);
-        i += 1;
-        while i < n {
-          out.push(b[i]);
-          if b[i] == b'\\' && i + 1 < n {
-            out.push(b[i + 1]);
-            i += 2;
-            continue;
-          }
-          if b[i] == q {
-            i += 1;
-            break;
-          }
-          i += 1;
-        }
-        prev_sig = q;
-      }
-      b'`' => {
-        out.push(b'`');
-        i += 1;
-        while i < n {
-          out.push(b[i]);
-          if b[i] == b'\\' && i + 1 < n {
-            out.push(b[i + 1]);
-            i += 2;
-            continue;
-          }
-          if b[i] == b'`' {
-            i += 1;
-            break;
-          }
-          i += 1;
-        }
-        prev_sig = b'`';
-      }
-      b'/' => {
-        let regex_ok = matches!(
-          prev_sig,
-          0 | b'('
-            | b','
-            | b'='
-            | b':'
-            | b'['
-            | b'!'
-            | b'&'
-            | b'|'
-            | b'?'
-            | b'{'
-            | b'}'
-            | b';'
-            | b'+'
-            | b'-'
-            | b'*'
-            | b'%'
-            | b'<'
-            | b'>'
-            | b'^'
-            | b'~'
-        );
-        if regex_ok {
-          out.push(b'/');
-          i += 1;
-          let mut in_class = false;
-          while i < n {
-            out.push(b[i]);
-            if b[i] == b'\\' && i + 1 < n {
-              out.push(b[i + 1]);
-              i += 2;
-              continue;
-            }
-            match b[i] {
-              b'[' => in_class = true,
-              b']' => in_class = false,
-              b'/' if !in_class => {
-                i += 1;
-                break;
-              }
-              _ => {}
-            }
-            i += 1;
-          }
-          prev_sig = b'/';
-        } else {
-          out.push(b'/');
-          prev_sig = b'/';
-          i += 1;
-        }
-      }
-      _ => {
-        if !c.is_ascii_whitespace() {
-          prev_sig = if is_ident(c) { b'a' } else { c };
-        }
-        out.push(c);
-        i += 1;
-      }
-    }
-  }
-  std::string::String::from_utf8_lossy(&out).into_owned()
-}
-
-fn join_module_statements(src: &str) -> Vec<std::string::String> {
-  let lines: Vec<&str> = src.lines().collect();
-  let mut result: Vec<std::string::String> = Vec::new();
-  let mut i = 0;
-  while i < lines.len() {
-    let trimmed = lines[i].trim();
-    // Only JOIN true named-binding lists (`import {`, `export {`, `import a,
-    // {`). A declaration like `export class X {` / `export function f() {` also
-    // "starts with export and has an unclosed {", but its `{` opens a body —
-    // joining to the next `}` would swallow the declaration into the `export {}`
-    // handler and drop the class/function header.
-    let after_kw = trimmed
-      .strip_prefix("import")
-      .or_else(|| trimmed.strip_prefix("export"))
-      .map(str::trim_start)
-      .unwrap_or("");
-    let import_binding = trimmed.starts_with("import")
-      && (after_kw.starts_with('{')
-        || after_kw
-          .split_once(',')
-          .map(|(_, r)| r.trim_start().starts_with('{'))
-          .unwrap_or(false));
-    let export_binding =
-      trimmed.starts_with("export") && after_kw.starts_with('{');
-    let starts_brace_stmt = (import_binding || export_binding)
-      && trimmed.contains('{')
-      && !trimmed.contains('}');
-    if starts_brace_stmt {
-      let mut buf = std::string::String::new();
-      buf.push_str(lines[i].trim_end());
-      buf.push(' ');
-      let mut closed = false;
-      i += 1;
-      while i < lines.len() {
-        let l = lines[i];
-        buf.push_str(l.trim());
-        buf.push(' ');
-        if l.contains('}') {
-          closed = true;
-
-          i += 1;
-
-          if !buf.contains(" from ")
-            && !buf.trim_end().ends_with(';')
-            && i < lines.len()
-            && lines[i].trim_start().starts_with("from ")
-          {
-            buf.push_str(lines[i].trim());
-            buf.push(' ');
-            i += 1;
-          }
-          break;
-        }
-        i += 1;
-      }
-      let _ = closed;
-      result.push(buf.split_whitespace().collect::<Vec<_>>().join(" "));
-    } else {
-      result.push(lines[i].to_string());
-      i += 1;
-    }
-  }
-  result
-}
-
-fn strip_leading_block_comments(mut s: &str) -> &str {
-  loop {
-    s = s.trim_start();
-    if let Some(rest) = s.strip_prefix("/*") {
-      if let Some(end) = rest.find("*/") {
-        s = &rest[end + 2..];
-        continue;
-      }
-    }
-    return s;
-  }
-}
-
-fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
-  let mut out = std::string::String::new();
-
-  let mut imports_out = std::string::String::new();
-
-  let mut exports_out = std::string::String::new();
-  let mut export_names: Vec<std::string::String> = Vec::new();
-  let mut imports: Vec<std::string::String> = Vec::new();
-  let mut reexports: Vec<(
-    std::string::String,
-    std::string::String,
-    std::string::String,
-  )> = Vec::new();
-  // localName -> (source spec, source export name) for every imported binding,
-  // so a later `export { localName }` can re-export it LIVE to the source.
-  let mut import_bindings: std::collections::HashMap<
-    std::string::String,
-    (std::string::String, std::string::String),
-  > = std::collections::HashMap::new();
-  // `export * from spec` (None) / `export * as name from spec` (Some(name)).
-  let mut star_reexports: Vec<(
-    std::string::String,
-    Option<std::string::String>,
-  )> = Vec::new();
-
-  let cleaned = strip_js_comments(src);
-  let logical = join_module_statements(&cleaned);
-
-  for raw_line in logical.iter() {
-    let raw_line: &str = raw_line.as_str();
-    let line = raw_line.trim_start();
-    let trimmed = strip_leading_block_comments(line.trim());
-
-    if trimmed.starts_with("export *") {
-      // `export * from "spec"` (star re-export) or `export * as ns from "spec"`
-      // (namespace re-export). Collect; emit copy code AFTER local exports so
-      // local/named exports win (ESM precedence).
-      let spec = extract_specifier(trimmed).unwrap_or_default();
-      if spec.is_empty() {
-        return None;
-      }
-      imports.push(spec.clone());
-      let after = trimmed["export *".len()..].trim_start();
-      let as_name = after.strip_prefix("as ").map(|rest| {
-        rest.split(" from ").next().unwrap_or("").trim().to_string()
-      });
-      if let Some(ref n) = as_name {
-        if !n.is_empty() {
-          export_names.push(n.clone());
-        }
-      }
-      star_reexports.push((spec, as_name));
-      continue;
-    }
-
-    if trimmed.starts_with("import ") || trimmed == "import" {
-      let spec = extract_specifier(trimmed).unwrap_or_default();
-      if !spec.is_empty() {
-        imports.push(spec.clone());
-      }
-      let module_expr =
-        format!("((globalThis.__v8jsc_modules||{{}})[{:?}]||{{}})", spec);
-
-      let clause =
-        if let Some((c, _)) = trimmed["import".len()..].split_once(" from ") {
-          c.trim()
-        } else {
-          ""
-        };
-
-      if clause.contains('{') {
-        let brace_start = clause.find('{').unwrap();
-        let head = clause[..brace_start].trim().trim_end_matches(',').trim();
-        if !head.is_empty() {
-          imports_out
-            .push_str(&format!("const {} = {}.default;\n", head, module_expr));
-          import_bindings
-            .insert(head.to_string(), (spec.clone(), "default".to_string()));
-        }
-
-        let names = between(trimmed, '{', '}').unwrap_or_default();
-        let mut destructure: Vec<std::string::String> = Vec::new();
-        for part in names.split(',') {
-          let part = part.trim();
-          if part.is_empty() {
-            continue;
-          }
-          if let Some((l, r)) = part.split_once(" as ") {
-            destructure.push(format!("{}: {}", l.trim(), r.trim()));
-            import_bindings.insert(
-              r.trim().to_string(),
-              (spec.clone(), l.trim().to_string()),
-            );
-          } else {
-            destructure.push(part.to_string());
-            import_bindings
-              .insert(part.to_string(), (spec.clone(), part.to_string()));
-          }
-        }
-        imports_out.push_str(&format!(
-          "const {{ {} }} = {};\n",
-          destructure.join(", "),
-          module_expr
-        ));
-      } else if clause.starts_with("* as ") {
-        let name = clause["* as ".len()..].trim();
-        if !name.is_empty() {
-          imports_out.push_str(&format!("const {} = {};\n", name, module_expr));
-          import_bindings
-            .insert(name.to_string(), (spec.clone(), "*".to_string()));
-        }
-      } else if !clause.is_empty() && trimmed.contains(" from ") {
-        imports_out
-          .push_str(&format!("const {} = {}.default;\n", clause, module_expr));
-        import_bindings
-          .insert(clause.to_string(), (spec.clone(), "default".to_string()));
-      }
-
-      continue;
-    }
-
-    if trimmed.starts_with("export {") || trimmed.starts_with("export{") {
-      let inner = between(trimmed, '{', '}').unwrap_or_default();
-
-      let reexport_spec = if trimmed.contains(" from ") {
-        let spec = extract_specifier(trimmed).unwrap_or_default();
-        if !spec.is_empty() {
-          imports.push(spec.clone());
-        }
-        Some(spec)
-      } else {
-        None
-      };
-      for part in inner.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-          continue;
-        }
-        let (local, exported) = if let Some((l, r)) = part.split_once(" as ") {
-          (l.trim().to_string(), r.trim().to_string())
-        } else {
-          (part.to_string(), part.to_string())
-        };
-        export_names.push(exported.clone());
-        if let Some(spec) = &reexport_spec {
-          // `export { local } from spec`: live re-export to spec.
-          reexports.push((exported.clone(), spec.clone(), local.clone()));
-        } else if let Some((spec, source)) = import_bindings.get(&local) {
-          // `import X from spec; export { X }` (barrel pattern): X is an
-          // imported binding, so re-export LIVE to its source module instead of
-          // snapshotting at body time (the barrel body runs last, after its
-          // importers already read the binding).
-          reexports.push((exported.clone(), spec.clone(), source.clone()));
-        } else {
-          exports_out.push_str(&format!("__ns[{:?}] = {};\n", exported, local));
-        }
-      }
-      continue;
-    }
-
-    if trimmed.starts_with("export default ") {
-      // The default expression may span multiple lines (`export default {`
-      // ...multi-line object/class/function...). Emit a `const` binding inline
-      // in `out` so the body stays CONTIGUOUS with its opening, and assign the
-      // namespace slot from that binding at the end. (A prior single-line
-      // `__ns["default"] = (expr)` cut multi-line objects to `({)`.)
-      let expr = &trimmed["export default ".len()..];
-      export_names.push("default".to_string());
-      out.push_str("const __v8jsc_default = ");
-      out.push_str(expr);
-      out.push('\n');
-      exports_out.push_str("__ns[\"default\"] = __v8jsc_default;\n");
-      continue;
-    }
-
-    if trimmed.starts_with("export const ")
-      || trimmed.starts_with("export let ")
-      || trimmed.starts_with("export var ")
-      || trimmed.starts_with("export function ")
-      || trimmed.starts_with("export async function ")
-      || trimmed.starts_with("export class ")
-    {
-      let rest = trimmed.strip_prefix("export ").unwrap();
-
-      let after_kw = rest
-        .trim_start_matches("const ")
-        .trim_start_matches("let ")
-        .trim_start_matches("var ")
-        .trim_start_matches("async function ")
-        .trim_start_matches("function ")
-        .trim_start_matches("class ");
-
-      if after_kw.trim_start().starts_with('{') {
-        out.push_str(rest);
-        out.push('\n');
-        let inner = between(after_kw, '{', '}').unwrap_or_default();
-        for part in inner.split(',') {
-          let part = part.trim();
-          if part.is_empty() {
-            continue;
-          }
-
-          let local = part
-            .split(':')
-            .next_back()
-            .unwrap_or(part)
-            .split('=')
-            .next()
-            .unwrap_or(part)
-            .trim();
-          let name: std::string::String = local
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
-            .collect();
-          if !name.is_empty() {
-            export_names.push(name.clone());
-            exports_out.push_str(&format!("__ns[{:?}] = {};\n", name, name));
-          }
-        }
-        continue;
-      }
-      let name: std::string::String = after_kw
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
-        .collect();
-      out.push_str(rest);
-      out.push('\n');
-      if !name.is_empty() {
-        export_names.push(name.clone());
-        exports_out.push_str(&format!("__ns[{:?}] = {};\n", name, name));
-      }
-      continue;
-    }
-
-    out.push_str(raw_line);
-    out.push('\n');
-  }
-
-  // Emit `export *` copies last so explicit/named exports take precedence.
-  for (spec, as_name) in &star_reexports {
-    let module_expr =
-      format!("((globalThis.__v8jsc_modules||{{}})[{:?}]||{{}})", spec);
-    match as_name {
-      Some(name) if !name.is_empty() => {
-        // export * as name from spec -> bind the whole namespace object.
-        exports_out.push_str(&format!("__ns[{:?}] = {};\n", name, module_expr));
-      }
-      _ => {
-        // export * from spec -> live-copy every named export except `default`,
-        // not overriding bindings this module already defines.
-        exports_out.push_str(&format!(
-          "{{const __se={m};for(const __k of Object.keys(__se)){{\
-             if(__k!==\"default\"&&!Object.prototype.hasOwnProperty.call(__ns,__k)){{\
-               Object.defineProperty(__ns,__k,{{get:((k)=>()=>__se[k])(__k),\
-                 enumerable:true,configurable:true}});}}}}}}\n",
-          m = module_expr
-        ));
-      }
-    }
-  }
-
-  let combined = format!("{}{}{}", imports_out, out, exports_out);
-
-  let body = combined.replace("import.meta", "__v8jsc_meta");
-
-  Some(RewrittenModule {
-    body,
-    export_names,
-    imports,
-    is_async: has_top_level_await(src),
-    reexports,
-  })
-}
-
-fn has_top_level_await(src: &str) -> bool {
-  let b = src.as_bytes();
-  let n = b.len();
-  let mut i = 0usize;
-
-  let mut fn_body_depths: Vec<i32> = Vec::new();
-  let mut depth: i32 = 0;
-
-  let mut pending_fn_body = false;
-
-  let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
-
-  while i < n {
-    let c = b[i];
-    match c {
-      b'/' if i + 1 < n && b[i + 1] == b'/' => {
-        i += 2;
-        while i < n && b[i] != b'\n' {
-          i += 1;
-        }
-      }
-
-      b'/' if i + 1 < n && b[i + 1] == b'*' => {
-        i += 2;
-        while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
-          i += 1;
-        }
-        i += 2;
-      }
-
-      b'"' | b'\'' => {
-        let q = c;
-        i += 1;
-        while i < n {
-          if b[i] == b'\\' {
-            i += 2;
-            continue;
-          }
-          if b[i] == q {
-            i += 1;
-            break;
-          }
-          i += 1;
-        }
-      }
-
-      b'`' => {
-        i += 1;
-        while i < n {
-          if b[i] == b'\\' {
-            i += 2;
-            continue;
-          }
-          if b[i] == b'`' {
-            i += 1;
-            break;
-          }
-          i += 1;
-        }
-      }
-      b'{' => {
-        depth += 1;
-        if pending_fn_body {
-          fn_body_depths.push(depth);
-          pending_fn_body = false;
-        }
-        i += 1;
-      }
-      b'}' => {
-        if let Some(&d) = fn_body_depths.last() {
-          if d == depth {
-            fn_body_depths.pop();
-          }
-        }
-        depth -= 1;
-        i += 1;
-      }
-
-      b'=' if i + 1 < n && b[i + 1] == b'>' => {
-        pending_fn_body = true;
-        i += 2;
-      }
-      _ if is_ident(c) => {
-        let start = i;
-        while i < n && is_ident(b[i]) {
-          i += 1;
-        }
-        let word = &src[start..i];
-        let prev_is_dot = start > 0 && {
-          let mut j = start;
-          while j > 0 && (b[j - 1] as char).is_whitespace() {
-            j -= 1;
-          }
-          j > 0 && b[j - 1] == b'.'
-        };
-        match word {
-          "function" => {
-            pending_fn_body = true;
-          }
-          "await" if !prev_is_dot => {
-            // Genuine top-level await is at brace-depth 0 (a module-top
-            // statement). The function-body tracker misses async METHODS
-            // (`async foo() {}`, `async *g() {}`, `for await` inside them) —
-            // they have no `function` keyword/`=>`, so their await would
-            // false-positive as top-level and wrongly mark the module async,
-            // deadlocking its importers. Requiring depth 0 avoids that. (Misses
-            // the rare TLA inside a top-level `if`/`for` block; acceptable.)
-            if depth == 0 && fn_body_depths.is_empty() {
-              return true;
-            }
-          }
-          _ => {}
-        }
-      }
-      _ => {
-        i += 1;
-      }
-    }
-  }
-  false
-}
-
-fn extract_specifier(line: &str) -> Option<std::string::String> {
-  let scan = match line.rfind(" from ") {
-    Some(p) => &line[p + 6..],
-    None => line,
-  };
-  let bytes = scan.as_bytes();
-  let mut open = None;
-  let mut q = b'"';
-  for (i, &b) in bytes.iter().enumerate() {
-    if b == b'"' || b == b'\'' {
-      open = Some(i);
-      q = b;
-      break;
-    }
-  }
-  let open = open?;
-  for i in (open + 1)..bytes.len() {
-    if bytes[i] == q {
-      return Some(scan[open + 1..i].to_string());
-    }
-  }
-  None
-}
-
-fn extract_attr_type(stmt: &str) -> Option<std::string::String> {
-  let kw = stmt
-    .find(" with ")
-    .or_else(|| stmt.find(" with{"))
-    .or_else(|| stmt.find(" assert "))
-    .or_else(|| stmt.find(" assert{"))?;
-  let clause = &stmt[kw..];
-  let tpos = clause.find("type")?;
-  let after = &clause[tpos + 4..];
-  let bytes = after.as_bytes();
-  let mut open = None;
-  let mut q = b'"';
-  for (i, &b) in bytes.iter().enumerate() {
-    if b == b'"' || b == b'\'' {
-      open = Some(i);
-      q = b;
-      break;
-    }
-  }
-  let open = open?;
-  for i in (open + 1)..bytes.len() {
-    if bytes[i] == q {
-      return Some(after[open + 1..i].to_string());
-    }
-  }
-  None
-}
-
-fn between(s: &str, open: char, close: char) -> Option<std::string::String> {
-  let a = s.find(open)?;
-  let b = s[a + 1..].find(close)? + a + 1;
-  Some(s[a + 1..b].to_string())
 }
 
 #[unsafe(no_mangle)]
@@ -2354,42 +1677,6 @@ pub extern "C" fn v8__UnboundModuleScript__GetSourceMappingURL(
   intern_ctx::<Value>(ctx, v)
 }
 
-/// Byte offset of each import's specifier literal (the opening quote) in the
-/// source, matching V8's `ModuleRequest::GetSourceOffset`. Specifiers are
-/// resolved in requested-module order, advancing a cursor so repeated specifiers
-/// map to successive occurrences. Returns 0 for any not found (best-effort).
-/// ASCII offsets == V8's positions for these test sources.
-fn compute_import_offsets(
-  text: &str,
-  specifiers: &[std::string::String],
-) -> Vec<i32> {
-  let bytes = text.as_bytes();
-  let mut cursor = 0usize;
-  let mut out = Vec::with_capacity(specifiers.len());
-  for spec in specifiers {
-    let mut found = -1i32;
-    for quote in ['"', '\''] {
-      let needle = format!("{quote}{spec}{quote}");
-      if let Some(rel) = text[cursor..].find(&needle) {
-        let pos = cursor + rel;
-        // Prefer the earliest of the two quote styles.
-        if found < 0 || (pos as i32) < found {
-          found = pos as i32;
-        }
-      }
-    }
-    if found >= 0 {
-      // Advance past this specifier so a later identical specifier resolves to
-      // its own occurrence.
-      cursor = (found as usize + 1).min(bytes.len());
-      out.push(found);
-    } else {
-      out.push(0);
-    }
-  }
-  out
-}
-
 /// Per-import `with { ... }` / `assert { ... }` attributes, parallel to
 /// `specifiers`. JSC's module record only exposes a coarse type enum, so parse
 /// the attribute clause that follows each specifier literal in the source.
@@ -2398,14 +1685,14 @@ fn compute_import_attributes(
   text: &str,
   specifiers: &[std::string::String],
 ) -> Vec<Vec<(std::string::String, std::string::String)>> {
-  let offsets = compute_import_offsets(text, specifiers);
+  let offsets = import_offsets(text, specifiers);
   let mut out = Vec::with_capacity(specifiers.len());
   for (i, spec) in specifiers.iter().enumerate() {
     let mut attrs = Vec::new();
     let off = offsets[i];
-    if off >= 0 {
+    if off > 0 {
       // Position just past the specifier's closing quote.
-      let after = (off as usize + spec.len() + 2).min(text.len());
+      let after = (off + spec.len() + 2).min(text.len());
       let tail = text[after..].trim_start();
       // The attribute clause must immediately follow (modulo whitespace) and be
       // introduced by a `with`/`assert` keyword at a word boundary.
@@ -2537,7 +1824,7 @@ pub extern "C" fn v8__Module__GetModuleRequests(
   let specs: Vec<std::string::String> = module_state(this)
     .map(|m| m.import_specifiers.clone())
     .unwrap_or_default();
-  let offsets: Vec<i32> = module_state(this)
+  let offsets: Vec<usize> = module_state(this)
     .map(|m| m.import_offsets.clone())
     .unwrap_or_default();
   let attributes: Vec<Vec<(std::string::String, std::string::String)>> =
@@ -2653,13 +1940,41 @@ pub extern "C" fn v8__Module__GetModuleRequests(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__SourceOffsetToLocation(
-  _this: *const Module,
-  _offset: int,
+  this: *const Module,
+  offset: int,
   out: *mut Location,
 ) {
-  if !out.is_null() {
-    unsafe { ptr::write_bytes(out as *mut u8, 0u8, size_of::<Location>()) };
+  if out.is_null() {
+    return;
   }
+  unsafe { ptr::write_bytes(out as *mut u8, 0u8, size_of::<Location>()) };
+  let Some(m) = module_state(this) else {
+    return;
+  };
+  if m.source_line_starts.is_empty() {
+    return;
+  }
+  let offset = offset.max(0) as usize;
+  let line = m
+    .source_line_starts
+    .partition_point(|start| *start <= offset)
+    .saturating_sub(1);
+  let column = offset.saturating_sub(m.source_line_starts[line]);
+  let location = out as *mut [i32; 2];
+  unsafe {
+    (*location)[0] = line as i32;
+    (*location)[1] = column as i32;
+  }
+}
+
+fn line_starts(source: &str) -> Vec<usize> {
+  let mut starts = vec![0usize];
+  for (index, byte) in source.bytes().enumerate() {
+    if byte == b'\n' {
+      starts.push(index + 1);
+    }
+  }
+  starts
 }
 
 #[unsafe(no_mangle)]
@@ -2727,7 +2042,12 @@ pub extern "C" fn v8__Module__InstantiateModule(
   let Some(m) = module_state(this) else {
     return MaybeBool::JustFalse;
   };
-  if !matches!(m.status, ModuleStatus::Uninstantiated) {
+  if matches!(
+    m.status,
+    ModuleStatus::Instantiated
+      | ModuleStatus::Evaluated
+      | ModuleStatus::Instantiating
+  ) {
     return MaybeBool::JustTrue;
   }
 
@@ -2776,8 +2096,17 @@ pub extern "C" fn v8__Module__InstantiateModule(
     };
   }
 
-  m.status = ModuleStatus::Instantiating;
-  let specs = m.import_specifiers.clone();
+  let (specs, checks, importer) = {
+    let Some(m) = module_state(this) else {
+      return MaybeBool::JustFalse;
+    };
+    m.status = ModuleStatus::Instantiating;
+    (
+      m.import_specifiers.clone(),
+      m.import_checks.clone(),
+      m.specifier.clone(),
+    )
+  };
 
   let mut deps: Vec<*const Module> = Vec::new();
   for spec in &specs {
@@ -2788,9 +2117,39 @@ pub extern "C" fn v8__Module__InstantiateModule(
     }
 
     if let Some(dm) = module_state(dep) {
+      // ESM link errors are part of instantiation, before any dependency body
+      // runs. `export *` hides names from the rewriter, so such a dependency is
+      // always accepted.
+      if !dm.export_names.is_empty() && !dm.has_star_reexports {
+        for (check_spec, name, line) in &checks {
+          if check_spec != spec {
+            continue;
+          }
+          if dm.export_names.iter().any(|export| export == name) {
+            continue;
+          }
+          let message = format!(
+            "The requested module '{spec}' does not provide an export named '{name}'"
+          );
+          let error =
+            unsafe { make_syntax_error(ctx, &message, &importer, *line) };
+          crate::jsc::core::record_pending_exception(ctx, error);
+          if let Some(m) = module_state(this) {
+            m.status = ModuleStatus::Errored;
+          }
+          return MaybeBool::Nothing;
+        }
+      }
+
       if matches!(dm.status, ModuleStatus::Uninstantiated) {
-        let _ =
+        let linked =
           v8__Module__InstantiateModule(dep, context, cb, _source_callback);
+        if matches!(linked, MaybeBool::Nothing) {
+          if let Some(m) = module_state(this) {
+            m.status = ModuleStatus::Errored;
+          }
+          return MaybeBool::Nothing;
+        }
       }
     }
     deps.push(dep);
@@ -2801,6 +2160,48 @@ pub extern "C" fn v8__Module__InstantiateModule(
     m.status = ModuleStatus::Instantiated;
   }
   MaybeBool::JustTrue
+}
+
+/// A SyntaxError whose stack points at the import statement in the importer.
+///
+/// Evaluating a throwing script with the importer as its `sourceURL` and the
+/// import line as the starting line gives JSC a real stack for the error; a
+/// Rust-constructed error has none, and assigning `.stack` is not reliable.
+unsafe fn make_syntax_error(
+  ctx: JSContextRef,
+  message: &str,
+  importer: &str,
+  line: usize,
+) -> JSValueRef {
+  let source = format!("throw new SyntaxError({message:?});");
+  let Ok(cstr) = std::ffi::CString::new(source) else {
+    return unsafe { make_generic_error(ctx, message) };
+  };
+  let source_url = std::ffi::CString::new(importer)
+    .ok()
+    .map_or(ptr::null_mut(), |url| unsafe {
+      JSStringCreateWithUTF8CString(url.as_ptr())
+    });
+  unsafe {
+    let js = JSStringCreateWithUTF8CString(cstr.as_ptr());
+    let mut exc: JSValueRef = ptr::null();
+    let value = JSEvaluateScript(
+      ctx,
+      js,
+      ptr::null_mut(),
+      source_url,
+      line as i32,
+      &mut exc,
+    );
+    JSStringRelease(js);
+    if !source_url.is_null() {
+      JSStringRelease(source_url);
+    }
+    if value.is_null() && !exc.is_null() {
+      return exc;
+    }
+    make_generic_error(ctx, message)
+  }
 }
 
 unsafe fn resolve_dependency(
@@ -3047,6 +2448,17 @@ pub extern "C" fn v8__Module__Evaluate(
       let mod_l = crate::Local::from_raw(this).unwrap();
       eval_steps(ctx_l, mod_l)
     };
+    // A throwing evaluation step (a CommonJS module with a TDZ error, for one)
+    // leaves a pending exception. Turn it into a rejected evaluation promise so
+    // the importer/`import()` sees the rejection instead of an uncaught error.
+    let pending = crate::jsc::core::peek_pending_exception(current_iso());
+    if !pending.is_null() {
+      crate::jsc::core::clear_pending_exception(current_iso());
+      if let Some(m) = module_state(this) {
+        m.status = ModuleStatus::Errored;
+      }
+      return make_rejected_promise(ctx, pending);
+    }
     if let Some(m) = module_state(this) {
       m.status = ModuleStatus::Evaluated;
     }
@@ -3133,6 +2545,22 @@ fn make_resolved_promise(ctx: JSContextRef) -> *const Value {
   intern_ctx::<Value>(ctx, p)
 }
 
+/// Whether the synchronous wrapper parses. A module with top-level await only parses as the
+/// body of an async function; JSC reports the syntax error without evaluating anything.
+fn sync_wrapper_parses(ctx: JSContextRef, body: &str) -> bool {
+  let wrapped = format!("(function(__ns, __v8jsc_meta, __deps){{\n{body}\n}})");
+  let Ok(cstr) = std::ffi::CString::new(wrapped) else {
+    return false;
+  };
+  unsafe {
+    let js = JSStringCreateWithUTF8CString(cstr.as_ptr());
+    let mut exc: JSValueRef = ptr::null();
+    let ok = JSCheckScriptSyntax(ctx, js, ptr::null_mut(), 1, &mut exc);
+    JSStringRelease(js);
+    ok
+  }
+}
+
 unsafe fn eval_module_source(
   ctx: JSContextRef,
   rewritten: &str,
@@ -3144,8 +2572,9 @@ unsafe fn eval_module_source(
 ) -> Result<JSValueRef, JSValueRef> {
   let fail =
     |ctx: JSContextRef, exc: JSValueRef| -> Result<JSValueRef, JSValueRef> {
-      unsafe { report_module_exception(ctx, exc) };
-
+      // Do not record a pending exception: the caller converts this error into a
+      // rejected evaluation promise. A pending exception in the context would
+      // also surface as an uncaught error and race the rejection.
       let e = if exc.is_null() {
         make_generic_error(ctx, "module evaluation failed")
       } else {
@@ -3264,37 +2693,24 @@ fn make_rejected_promise(ctx: JSContextRef, exc: JSValueRef) -> *const Value {
     exc
   };
 
+  // Build the promise in the pending state, attach the tracking handlers, and
+  // reject it last. JSC reports an unhandled rejection at rejection time, so
+  // `Promise.reject(...)` followed by `.catch()` would still notify the host.
+  let mut resolve: JSObjectRef = ptr::null_mut();
+  let mut reject: JSObjectRef = ptr::null_mut();
   let mut e: JSValueRef = ptr::null();
-  let p = unsafe {
-    let global = JSContextGetGlobalObject(ctx);
-    let pkey = JSStringCreateWithUTF8CString(c"Promise".as_ptr());
-    let promise_ctor = JSObjectGetProperty(ctx, global, pkey, &mut e);
-    JSStringRelease(pkey);
-    if promise_ctor.is_null() || !JSValueIsObject(ctx, promise_ctor) {
-      return intern_ctx::<Value>(ctx, JSValueMakeUndefined(ctx));
-    }
-    let rkey = JSStringCreateWithUTF8CString(c"reject".as_ptr());
-    let reject =
-      JSObjectGetProperty(ctx, promise_ctor as JSObjectRef, rkey, &mut e);
-    JSStringRelease(rkey);
-    if reject.is_null() || !JSValueIsObject(ctx, reject) {
-      return intern_ctx::<Value>(ctx, JSValueMakeUndefined(ctx));
-    }
-    let args = [exc];
-    JSObjectCallAsFunction(
-      ctx,
-      reject as JSObjectRef,
-      promise_ctor as JSObjectRef,
-      1,
-      args.as_ptr(),
-      &mut e,
-    )
+  let promise = unsafe {
+    JSObjectMakeDeferredPromise(ctx, &mut resolve, &mut reject, &mut e)
   };
-  if p.is_null() {
+  if promise.is_null() || !e.is_null() || reject.is_null() {
     return intern_ctx::<Value>(ctx, unsafe { JSValueMakeUndefined(ctx) });
   }
-  crate::jsc::exception::track_promise_pub(ctx, p as JSObjectRef);
-  intern_ctx::<Value>(ctx, p)
+  crate::jsc::exception::track_promise_pub(ctx, promise);
+  let args = [exc];
+  unsafe {
+    JSObjectCallAsFunction(ctx, reject, promise, 1, args.as_ptr(), &mut e);
+  }
+  intern_ctx::<Value>(ctx, promise as JSValueRef)
 }
 
 /// Install live re-export getters on `namespace`: for each `export { local as
@@ -3422,13 +2838,6 @@ unsafe fn build_import_meta(
   meta as JSValueRef
 }
 
-unsafe fn report_module_exception(ctx: JSContextRef, exc: JSValueRef) {
-  if exc.is_null() {
-    return;
-  }
-  crate::jsc::core::record_pending_exception(ctx, exc);
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__IsGraphAsync(this: *const Module) -> bool {
   fn graph_async(this: *const Module, seen: &mut Vec<*const Module>) -> bool {
@@ -3551,7 +2960,10 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
     source_map_url: None,
     import_offsets: Vec::new(),
     import_attributes: Vec::new(),
+    source_line_starts: Vec::new(),
     import_specifiers: Vec::new(),
+    import_checks: Vec::new(),
+    has_star_reexports: false,
     namespace,
     specifier,
     dependencies: Vec::new(),
@@ -3637,9 +3049,13 @@ pub extern "C" fn v8__ModuleRequest__GetSpecifier(
     let mut exc: JSValueRef = ptr::null();
     let v = JSObjectGetProperty(ctx, obj, key, &mut exc);
     JSStringRelease(key);
-    if v.is_null() || JSValueIsUndefined(ctx, v) {
+    if v.is_null() {
       return ptr::null();
     }
+    // `ModuleRequest::get_specifier` wraps this pointer in a `String` without a type
+    // check and panics on null. An undefined specifier is still a value, so hand it
+    // back the way the QuickJS adapter does; deno_core reports "the engine did not
+    // provide a string" instead of aborting the process.
     intern_ctx::<V8String>(ctx, v)
   }
 }
