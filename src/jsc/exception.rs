@@ -490,6 +490,50 @@ pub(crate) fn track_promise_pub(ctx: JSContextRef, promise: JSObjectRef) {
   unsafe { track_promise(ctx, promise) }
 }
 
+/// Record a settlement `track_promise` cannot observe yet.
+///
+/// The system-JavaScriptCore fallback in `introspect.rs` reads these properties
+/// because the public C API cannot inspect a promise, and `track_promise` only
+/// learns the settlement from a reaction that runs at a microtask checkpoint. A
+/// nested `require(esm)` skips that checkpoint, so a promise the caller settled
+/// itself has to say so here. `state` is the state the promise is actually in:
+/// a pending promise stays `Pending`, and `result` is its fulfilment value or
+/// rejection reason. Call it after `track_promise`, and for a rejection only
+/// once that rejection actually happened — JSC reports unhandled rejections at
+/// rejection time, so the promise has to exist pending first.
+pub(crate) fn settle_tracked_promise(
+  ctx: JSContextRef,
+  promise: JSObjectRef,
+  state: PromiseState,
+  result: JSValueRef,
+) {
+  let state = match state {
+    PromiseState::Fulfilled => 1,
+    PromiseState::Rejected => 2,
+    PromiseState::Pending => return,
+  };
+  if ctx.is_null() || promise.is_null() {
+    return;
+  }
+  let attrs = 1 << 1;
+  let set = |name: &[u8], value: JSValueRef| {
+    let key = unsafe {
+      JSStringCreateWithUTF8CString(name.as_ptr() as *const c_char)
+    };
+    unsafe {
+      JSObjectSetProperty(ctx, promise, key, value, attrs, ptr::null_mut())
+    };
+    unsafe { JSStringRelease(key) };
+  };
+  set(
+    b"__v8jsc_state\0",
+    unsafe { JSValueMakeNumber(ctx, f64::from(state)) },
+  );
+  if !result.is_null() {
+    set(b"__v8jsc_result\0", result);
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Promise__State(this: *const Promise) -> PromiseState {
   let ctx = current_ctx();
