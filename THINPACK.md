@@ -188,6 +188,12 @@ This is still a text rewrite, not a parser. Statement recognition stays line-ori
 asynchronous wrapper still relies on the synchronous parse check for `await` inside a
 top-level block, and import-attribute extraction remains a source scan.
 
+### Synchronous module evaluation promises
+
+The system-framework shim settles the intrinsic promise before reporting its state to
+deno_core. A synchronous module can then be loaded by `require()` without being mistaken
+for top-level await. Thinpack covers this in `packed::esm-register-require-stays-sync`.
+
 ## Validation
 
 The startup patch is covered by the differential runs below, comparing the stock
