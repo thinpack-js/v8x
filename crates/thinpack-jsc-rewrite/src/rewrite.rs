@@ -13,6 +13,17 @@ use std::collections::HashMap;
 
 use crate::lexer::{Event, Kind, Lexer, Token, token_events, tokens};
 
+/// A static `import` or `export ... from` request found by the lexical scanner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StaticImport {
+  /// The specifier literal, without its quotes.
+  pub specifier: String,
+  /// Byte offset of the specifier literal's opening quote.
+  pub offset: usize,
+  /// `type` from the request's `with { ... }` or `assert { ... }` clause.
+  pub attribute_type: Option<String>,
+}
+
 /// A rewritten module body and the metadata the JSC wrapper needs.
 #[derive(Debug)]
 pub struct RewrittenModule {
@@ -129,7 +140,7 @@ pub fn rewrite_dynamic_import_calls(body: &str) -> String {
 /// not found maps to `0`, the offset V8 reports for a missing location.
 #[must_use]
 pub fn import_offsets(text: &str, specifiers: &[String]) -> Vec<usize> {
-  let entries = static_import_specifiers(text);
+  let entries = static_imports(text);
   let mut cursor = 0;
   specifiers
     .iter()
@@ -137,11 +148,11 @@ pub fn import_offsets(text: &str, specifiers: &[String]) -> Vec<usize> {
       let hit = entries
         .iter()
         .skip(cursor)
-        .position(|(_, value)| value == specifier);
+        .position(|entry| entry.specifier == *specifier);
       hit.map_or(0, |hit| {
         let index = cursor + hit;
         cursor = index + 1;
-        entries[index].0
+        entries[index].offset
       })
     })
     .collect()
@@ -827,41 +838,61 @@ fn skip_default(ts: &[Token<'_>], pos: &mut usize) {
   }
 }
 
-/// Source positions of the specifier literal of every static import/export.
-fn static_import_specifiers(src: &str) -> Vec<(usize, String)> {
+/// Every static `import` and `export ... from` request in source order.
+///
+/// The token stream makes comments, strings, template literals, and regular
+/// expressions opaque, so module syntax is found only where it is real.
+#[must_use]
+pub fn static_imports(src: &str) -> Vec<StaticImport> {
   let ts = tokens(src);
-  let mut specifiers = Vec::new();
+  let mut imports = Vec::new();
   for (index, token) in ts.iter().enumerate() {
     let prev_dot = index > 0 && ts[index - 1].is_punct(".");
     if token.is_ident("import") && !prev_dot {
       match ts.get(index + 1) {
         Some(next) if next.kind == Kind::String => {
           if let Some(value) = next.string_value() {
-            specifiers.push((next.start, value.to_owned()));
+            imports.push(StaticImport {
+              specifier: value.to_owned(),
+              offset: next.start,
+              attribute_type: import_attribute_type(&ts, index + 1),
+            });
           }
         }
         Some(next) if next.is_punct("(") || next.is_punct(".") => {}
         _ => {
-          if let Some(specifier) = from_specifier(&ts, src, index) {
-            specifiers.push(specifier);
+          if let Some((spec_index, offset, specifier)) =
+            from_specifier(&ts, src, index)
+          {
+            imports.push(StaticImport {
+              specifier,
+              offset,
+              attribute_type: import_attribute_type(&ts, spec_index),
+            });
           }
         }
       }
     } else if token.is_ident("export")
       && matches!(ts.get(index + 1), Some(next) if next.is_punct("*") || next.is_punct("{"))
-      && let Some(specifier) = from_specifier(&ts, src, index)
+      && let Some((spec_index, offset, specifier)) =
+        from_specifier(&ts, src, index)
     {
-      specifiers.push(specifier);
+      imports.push(StaticImport {
+        specifier,
+        offset,
+        attribute_type: import_attribute_type(&ts, spec_index),
+      });
     }
   }
-  specifiers
+  imports
 }
 
+/// The `from` specifier of a declaration as `(token index, byte offset, value)`.
 fn from_specifier(
   ts: &[Token<'_>],
   src: &str,
   start: usize,
-) -> Option<(usize, String)> {
+) -> Option<(usize, usize, String)> {
   let mut depth = 0usize;
   let mut previous_end = ts.get(start)?.end;
   for (index, token) in ts.iter().enumerate().skip(start + 1) {
@@ -877,7 +908,7 @@ fn from_specifier(
         {
           return next
             .string_value()
-            .map(|value| (next.start, value.to_owned()));
+            .map(|value| (index + 1, next.start, value.to_owned()));
         }
       } else if token.is_punct(";")
         || starts_statement(src, previous_end, *token)
@@ -886,6 +917,46 @@ fn from_specifier(
       }
     }
     previous_end = token.end;
+  }
+  None
+}
+
+/// The `type` value from the clause immediately after a specifier literal.
+fn import_attribute_type(
+  ts: &[Token<'_>],
+  specifier_index: usize,
+) -> Option<String> {
+  let keyword = ts.get(specifier_index + 1)?;
+  if !keyword.is_ident("with") && !keyword.is_ident("assert") {
+    return None;
+  }
+  if !ts.get(specifier_index + 2)?.is_punct("{") {
+    return None;
+  }
+  let mut index = specifier_index + 3;
+  while let Some(key) = ts.get(index) {
+    if key.is_punct("}") {
+      return None;
+    }
+    let name = match key.kind {
+      Kind::Ident => key.text,
+      Kind::String => key.string_value()?,
+      _ => return None,
+    };
+    if !ts.get(index + 1)?.is_punct(":") {
+      return None;
+    }
+    let value = ts.get(index + 2)?;
+    if value.kind != Kind::String {
+      return None;
+    }
+    if name == "type" {
+      return value.string_value().map(str::to_owned);
+    }
+    index += 3;
+    if ts.get(index).is_some_and(|token| token.is_punct(",")) {
+      index += 1;
+    }
   }
   None
 }
@@ -916,7 +987,7 @@ fn starts_statement(src: &str, previous_end: usize, token: Token<'_>) -> bool {
 }
 
 struct SpecifierLines {
-  entries: Vec<(usize, String)>,
+  entries: Vec<StaticImport>,
   line_starts: Vec<usize>,
   cursor: usize,
 }
@@ -924,7 +995,7 @@ struct SpecifierLines {
 impl SpecifierLines {
   fn new(src: &str) -> Self {
     Self {
-      entries: static_import_specifiers(src),
+      entries: static_imports(src),
       line_starts: line_starts(src),
       cursor: 0,
     }
@@ -936,13 +1007,13 @@ impl SpecifierLines {
       .entries
       .iter()
       .skip(self.cursor)
-      .position(|(_, value)| value == specifier)
+      .position(|entry| entry.specifier == specifier)
     else {
       return 1;
     };
     let index = self.cursor + hit;
     self.cursor = index + 1;
-    let offset = self.entries[index].0;
+    let offset = self.entries[index].offset;
     self.line_starts.partition_point(|start| *start <= offset)
   }
 }

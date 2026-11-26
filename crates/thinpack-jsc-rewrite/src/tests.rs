@@ -2,7 +2,7 @@ use crate::lexer::tokens;
 use crate::rewrite::{binding_names, strip_comments};
 use crate::{
   has_top_level_await, import_offsets, rewrite_dynamic_import_calls,
-  rewrite_es_module,
+  rewrite_es_module, static_imports,
 };
 
 fn exported_names(source: &str) -> Vec<String> {
@@ -70,6 +70,52 @@ fn slash_equals_is_a_regex_only_in_expression_position() {
 
   let ts = tokens("count /= 2;");
   assert!(ts[1].is_punct("/="));
+}
+
+#[test]
+fn static_imports_skip_regex_and_division() {
+  let source = "import { sep } from \"node:path\"; const re = /\\//; const ratio = total / count; import { readFileSync } from \"fs\";";
+  let imports: Vec<_> = static_imports(source)
+    .into_iter()
+    .map(|request| request.specifier)
+    .collect();
+  assert_eq!(imports, specifiers(&["node:path", "fs"]));
+}
+
+#[test]
+fn static_imports_keep_order_offsets_and_literal_contents() {
+  let source = r#"const fake = "fs";
+import "./first.js";
+import data from "./data.json" with { type: "json" };
+const re = /\//;
+import { readFileSync } from "fs";
+import "./a\\b.js" with { type: "json" };
+export * from "./first.js";
+"#;
+  let imports = static_imports(source);
+  assert_eq!(
+    imports
+      .iter()
+      .map(|request| request.specifier.as_str())
+      .collect::<Vec<_>>(),
+    vec![
+      "./first.js",
+      "./data.json",
+      "fs",
+      r"./a\\b.js",
+      "./first.js"
+    ]
+  );
+  assert_eq!(
+    imports
+      .iter()
+      .map(|request| request.attribute_type.as_deref())
+      .collect::<Vec<_>>(),
+    vec![None, Some("json"), None, Some("json"), None]
+  );
+  assert!(source[imports[0].offset..].starts_with("\"./first.js\""));
+  assert!(source[imports[3].offset..].starts_with(r#""./a\\b.js""#));
+  assert!(imports[4].offset > imports[3].offset);
 }
 
 #[test]

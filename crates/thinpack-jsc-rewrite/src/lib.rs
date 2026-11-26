@@ -22,6 +22,6 @@ mod rewrite;
 mod tests;
 
 pub use rewrite::{
-  RewrittenModule, has_top_level_await, import_offsets,
-  rewrite_dynamic_import_calls, rewrite_es_module,
+  RewrittenModule, StaticImport, has_top_level_await, import_offsets,
+  rewrite_dynamic_import_calls, rewrite_es_module, static_imports,
 };
