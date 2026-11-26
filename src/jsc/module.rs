@@ -18,8 +18,8 @@ use crate::jsc::core::{
 use crate::jsc::jsc_sys::*;
 use crate::{
   Context, Data, FixedArray, Function, Message, Module, ModuleRequest, Object,
-  Primitive, RealIsolate, Script, String as V8String, UnboundModuleScript,
-  UnboundScript, Value,
+  Primitive, PromiseState, RealIsolate, Script, String as V8String,
+  UnboundModuleScript, UnboundScript, Value,
 };
 
 use crate::isolate::ModuleImportPhase;
@@ -1406,8 +1406,8 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
     // The source heuristic misses top-level await inside a block (a `try`, an `if`,
     // a loop). Parse the synchronous wrapper; a TLA module fails that parse and is
     // wrapped in an async function instead.
-    let is_async = rewrite.is_async
-      || !sync_wrapper_parses(gctx as JSContextRef, &rewrite.body);
+    let is_async =
+      rewrite.is_async || !sync_wrapper_parses(gctx as JSContextRef, &rewrite.body);
 
     let namespace =
       unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
@@ -2131,8 +2131,9 @@ pub extern "C" fn v8__Module__InstantiateModule(
           let message = format!(
             "The requested module '{spec}' does not provide an export named '{name}'"
           );
-          let error =
-            unsafe { make_syntax_error(ctx, &message, &importer, *line) };
+          let error = unsafe {
+            make_syntax_error(ctx, &message, &importer, *line)
+          };
           crate::jsc::core::record_pending_exception(ctx, error);
           if let Some(m) = module_state(this) {
             m.status = ModuleStatus::Errored;
@@ -2527,28 +2528,40 @@ fn make_resolved_promise(ctx: JSContextRef) -> *const Value {
   if ctx.is_null() {
     return ptr::null();
   }
-  let src = b"Promise.resolve(undefined)\0";
+  // An intrinsic already-fulfilled promise: `Promise.resolve()` would go through
+  // the replaceable global, and the state recorded below has to be a fact about
+  // this promise rather than an assumption about it.
+  let mut resolve: JSObjectRef = ptr::null_mut();
+  let mut reject: JSObjectRef = ptr::null_mut();
   let mut exc: JSValueRef = ptr::null();
-  let js = unsafe {
-    JSStringCreateWithUTF8CString(src.as_ptr() as *const std::os::raw::c_char)
+  let promise = unsafe {
+    JSObjectMakeDeferredPromise(ctx, &mut resolve, &mut reject, &mut exc)
   };
-  let p = unsafe {
-    JSEvaluateScript(ctx, js, ptr::null_mut(), ptr::null_mut(), 1, &mut exc)
-  };
-  unsafe { JSStringRelease(js) };
-  if p.is_null() {
-    let v = unsafe { JSValueMakeUndefined(ctx) };
-    return intern_ctx::<Value>(ctx, v);
+  if !promise.is_null() && exc.is_null() && !resolve.is_null() {
+    let undefined = unsafe { JSValueMakeUndefined(ctx) };
+    let args = [undefined];
+    unsafe {
+      JSObjectCallAsFunction(ctx, resolve, promise, 1, args.as_ptr(), &mut exc)
+    };
+    if exc.is_null() {
+      crate::jsc::exception::track_promise_pub(ctx, promise);
+      crate::jsc::exception::settle_tracked_promise(
+        ctx,
+        promise,
+        PromiseState::Fulfilled,
+        undefined,
+      );
+      return intern_ctx::<Value>(ctx, promise as JSValueRef);
+    }
   }
-
-  crate::jsc::exception::track_promise_pub(ctx, p as JSObjectRef);
-  intern_ctx::<Value>(ctx, p)
+  intern_ctx::<Value>(ctx, unsafe { JSValueMakeUndefined(ctx) })
 }
 
 /// Whether the synchronous wrapper parses. A module with top-level await only parses as the
 /// body of an async function; JSC reports the syntax error without evaluating anything.
 fn sync_wrapper_parses(ctx: JSContextRef, body: &str) -> bool {
-  let wrapped = format!("(function(__ns, __v8jsc_meta, __deps){{\n{body}\n}})");
+  let wrapped =
+    format!("(function(__ns, __v8jsc_meta, __deps){{\n{body}\n}})");
   let Ok(cstr) = std::ffi::CString::new(wrapped) else {
     return false;
   };
@@ -2699,16 +2712,30 @@ fn make_rejected_promise(ctx: JSContextRef, exc: JSValueRef) -> *const Value {
   let mut resolve: JSObjectRef = ptr::null_mut();
   let mut reject: JSObjectRef = ptr::null_mut();
   let mut e: JSValueRef = ptr::null();
-  let promise = unsafe {
-    JSObjectMakeDeferredPromise(ctx, &mut resolve, &mut reject, &mut e)
-  };
+  let promise =
+    unsafe { JSObjectMakeDeferredPromise(ctx, &mut resolve, &mut reject, &mut e) };
   if promise.is_null() || !e.is_null() || reject.is_null() {
     return intern_ctx::<Value>(ctx, unsafe { JSValueMakeUndefined(ctx) });
   }
   crate::jsc::exception::track_promise_pub(ctx, promise);
   let args = [exc];
   unsafe {
-    JSObjectCallAsFunction(ctx, reject, promise, 1, args.as_ptr(), &mut e);
+    JSObjectCallAsFunction(
+      ctx,
+      reject,
+      promise,
+      1,
+      args.as_ptr(),
+      &mut e,
+    );
+  }
+  if e.is_null() {
+    crate::jsc::exception::settle_tracked_promise(
+      ctx,
+      promise,
+      PromiseState::Rejected,
+      exc,
+    );
   }
   intern_ctx::<Value>(ctx, promise as JSValueRef)
 }
