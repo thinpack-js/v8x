@@ -7,9 +7,23 @@ use timezone_provider::zoneinfo64::ZoneInfo64TzdbProvider;
 
 fn provider() -> &'static ZoneInfo64TzdbProvider<'static> {
   static PROVIDER: OnceLock<ZoneInfo64TzdbProvider<'static>> = OnceLock::new();
+  static ZONEINFO: OnceLock<Vec<u32>> = OnceLock::new();
   PROVIDER.get_or_init(|| {
-    ZoneInfo64TzdbProvider::zoneinfo64_provider_for_testing()
-      .expect("bundled zoneinfo64 data is invalid")
+    let resource = ZONEINFO.get_or_init(|| {
+      let mut bytes = Vec::new();
+      let mut compressed =
+        &include_bytes!("../../vendor/temporal-polyfill/zoneinfo64.res.br")[..];
+      brotli_decompressor::BrotliDecompress(&mut compressed, &mut bytes)
+        .expect("invalid compressed zoneinfo64 data");
+      assert_eq!(bytes.len() % 4, 0, "unaligned zoneinfo64 data");
+      bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_ne_bytes(word.try_into().expect("zoneinfo word")))
+        .collect()
+    });
+    let resource = zoneinfo64::ZoneInfo64::try_from_u32s(resource)
+      .expect("bundled zoneinfo64 data is invalid");
+    ZoneInfo64TzdbProvider::new(resource)
   })
 }
 
@@ -227,15 +241,15 @@ pub(crate) unsafe fn install(ctx: *mut JSContext, global: JSValue) {
   }
 
   const POLYFILL: &[u8] =
-    include_bytes!("../../vendor/temporal-polyfill/index.umd.js");
+    include_bytes!("../../vendor/temporal-polyfill/index.umd.js.br");
   static POLYFILL_BYTECODE: OnceLock<Vec<u8>> = OnceLock::new();
+  let mut source = Vec::new();
+  if POLYFILL_BYTECODE.get().is_none() {
+    brotli_decompressor::BrotliDecompress(&mut &POLYFILL[..], &mut source)
+      .expect("invalid bundled Temporal source");
+  }
   let result = unsafe {
-    eval_cached_script(
-      ctx,
-      POLYFILL,
-      c"<temporal-polyfill>",
-      &POLYFILL_BYTECODE,
-    )
+    eval_cached_script(ctx, &source, c"<temporal-polyfill>", &POLYFILL_BYTECODE)
   };
   if result.tag == JS_TAG_EXCEPTION {
     let exception = unsafe { JS_GetException(ctx) };
