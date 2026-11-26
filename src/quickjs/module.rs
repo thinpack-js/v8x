@@ -302,6 +302,57 @@ mod cache_key_tests {
   }
 
   #[test]
+  fn import_scan_uses_lexical_regex_context() {
+    let source = r#"
+import { sep } from "node:path";
+const escaped = cmd.match(/\//);
+const quoted = /import \{ fake \} from "fake"/;
+const tick = /`/;
+const ratio = total / count / 2;
+// import { line_comment } from "line-comment";
+/* import { block_comment } from "block-comment"; */
+const text = "import { string } from 'string'";
+const body = `import { template } from 'template'; ${total / count}`;
+import data from "./data.json" with { type: "json" };
+import { readFileSync } from "fs";
+export * from "./after-regex.js";
+"#;
+    assert_eq!(
+      parse_import_specifiers(source),
+      vec![
+        ("node:path".to_string(), None),
+        ("./data.json".to_string(), Some("json".to_string())),
+        ("fs".to_string(), None),
+        ("./after-regex.js".to_string(), None),
+      ]
+    );
+  }
+
+  #[test]
+  fn static_import_metadata_uses_lexical_offsets() {
+    let source = "const fake = \"fs\";\nimport data from \"fs\" with { type: \"json\" };\nimport \"./a\\\\b.js\";\n";
+    let (specifiers, offsets, attributes) = static_import_metadata(source);
+    assert_eq!(
+      specifiers,
+      vec![
+        ("fs".to_string(), Some("json".to_string())),
+        (r"./a\\b.js".to_string(), None),
+      ]
+    );
+    assert_eq!(
+      offsets,
+      vec![
+        source.find("\"fs\" with").unwrap() as i32,
+        source.find(r#""./a\\b.js""#).unwrap() as i32,
+      ]
+    );
+    assert_eq!(attributes[0].len(), 1);
+    assert_eq!(attributes[0][0].0, "type");
+    assert_eq!(attributes[0][0].1, "json");
+    assert!(attributes[1].is_empty());
+  }
+
+  #[test]
   fn module_caches_follow_nested_isolates() {
     let outer = 1usize as *mut RealIsolate;
     let inner = 2usize as *mut RealIsolate;
@@ -1936,167 +1987,58 @@ unsafe fn jsval_to_rust(
   s
 }
 
+fn parse_static_imports(src: &str) -> Vec<thinpack_jsc_rewrite::StaticImport> {
+  let imports = thinpack_jsc_rewrite::static_imports(src);
+  if std::env::var_os("QJS_DEBUG_PARSE").is_some() {
+    for request in &imports {
+      eprintln!(
+        "[QJS parse] spec={:?} type={:?}",
+        request.specifier, request.attribute_type
+      );
+    }
+  }
+  imports
+}
+
 fn parse_import_specifiers(
   src: &str,
 ) -> Vec<(std::string::String, Option<std::string::String>)> {
-  let mut out = Vec::new();
-  let bytes = src.as_bytes();
-  let mut i = 0usize;
-  let n = bytes.len();
-  while i < n {
-    while i < n && bytes[i].is_ascii_whitespace() {
-      i += 1;
-    }
-    if i >= n {
-      break;
-    }
+  parse_static_imports(src)
+    .into_iter()
+    .map(|request| (request.specifier, request.attribute_type))
+    .collect()
+}
 
-    if i + 1 < n && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-      while i < n && bytes[i] != b'\n' {
-        i += 1;
-      }
-      continue;
-    }
-
-    if i + 1 < n && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-      i += 2;
-      while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-        i += 1;
-      }
-      i += 2;
-      continue;
-    }
-
-    if bytes[i] == b'"' || bytes[i] == b'\'' {
-      i = skip_string(bytes, i, bytes[i]);
-      continue;
-    }
-    if bytes[i] == b'`' {
-      i = skip_template(bytes, i);
-      continue;
-    }
-
-    let at_boundary = i == 0
-      || matches!(
-        bytes[i - 1],
-        b' ' | b'\t' | b'\r' | b'\n' | b';' | b'{' | b'}'
-      );
-    if !at_boundary {
-      i += 1;
-      continue;
-    }
-
-    let rest = &src[i..];
-    let is_import = rest.starts_with("import")
-      && rest[6..]
-        .chars()
-        .next()
-        .map(|c| {
-          c == ' ' || c == '{' || c == '*' || c == '"' || c == '\'' || c == '('
-        })
-        .unwrap_or(false);
-
-    let after_export = rest.get(6..).map(|s| s.trim_start()).unwrap_or("");
-    let is_export = rest.starts_with("export")
-      && (after_export.starts_with('*') || after_export.starts_with('{'));
-    if is_import || is_export {
-      let dynamic = rest.starts_with("import(") || rest.starts_with("import (");
-
-      let mut j = i;
-      let mut depth = 0i32;
-      let mut end = n;
-      while j < n {
-        match bytes[j] {
-          b'"' | b'\'' => {
-            j = skip_string(bytes, j, bytes[j]);
-            continue;
-          }
-          b'`' => {
-            j = skip_template(bytes, j);
-            continue;
-          }
-          b'{' => depth += 1,
-          b'}' => depth -= 1,
-          b';' if depth <= 0 => {
-            end = j;
-            break;
-          }
-          b'\n' if depth <= 0 && j > i => {
-            let seg = &src[i..j];
-            if seg.contains(" from ") || seg.contains("\"") || seg.contains("'")
-            {
-              if has_balanced_quotes(seg) {
-                end = j;
-                break;
-              }
-            }
-          }
-          _ => {}
-        }
-        j += 1;
-      }
-      let stmt = &src[i..end.min(n)];
-      if !dynamic {
-        let has_from = find_from_specifier_start(stmt).is_some();
-
-        let bare_immediate = stmt
-          .strip_prefix("import")
-          .map(|r| {
-            let t = r.trim_start();
-            t.starts_with('"') || t.starts_with('\'')
-          })
-          .unwrap_or(false);
-        let bare = is_import && !has_from && bare_immediate;
-
-        let bare_ok = bare && bare_import_well_formed(stmt);
-        if has_from || bare_ok {
-          if let Some(spec) = extract_specifier(stmt) {
-            if !spec.is_empty() {
-              let ty = extract_attr_type(stmt);
-              if std::env::var_os("QJS_DEBUG_PARSE").is_some() {
-                let snip: std::string::String = stmt.chars().take(80).collect();
-                eprintln!(
-                  "[QJS parse] spec={spec:?} type={ty:?} stmt={snip:?}"
-                );
-              }
-              out.push((spec, ty));
-            }
-          }
-        }
-      }
-      i = end.min(n) + 1;
-      continue;
-    }
-
-    i += 1;
-  }
-  out
+/// Specifiers, source offsets, and full attribute sets in tokenizer order.
+fn static_import_metadata(
+  src: &str,
+) -> (
+  Vec<(std::string::String, Option<std::string::String>)>,
+  Vec<i32>,
+  Vec<Vec<ImportAttribute>>,
+) {
+  let imports = parse_static_imports(src);
+  let specifiers = imports
+    .iter()
+    .map(|request| (request.specifier.clone(), request.attribute_type.clone()))
+    .collect();
+  let offsets = imports
+    .iter()
+    .map(|request| request.offset as i32)
+    .collect();
+  let attributes = imports
+    .iter()
+    .map(|request| {
+      import_attributes_at(src, request.offset, &request.specifier)
+    })
+    .collect();
+  (specifiers, offsets, attributes)
 }
 
 /// Byte offset of each specifier literal's opening quote in `text`, parallel to
 /// `specifiers`. This is V8's `ModuleRequest::source_offset` /
 /// deno's `referrer_source_offset`. A cursor advances past each match so a later
 /// identical specifier resolves to its own occurrence.
-/// Extract the last `//# sourceMappingURL=<url>` (or legacy `//@`) magic comment
-/// from module source, mirroring V8's UnboundModuleScript::GetSourceMappingURL.
-/// V8 honours the LAST occurrence; the URL is the trimmed remainder of the line.
-/// Trailing content/blank lines after the directive are ignored (deno#21988).
-fn extract_source_mapping_url(text: &str) -> Option<std::string::String> {
-  let mut found: Option<std::string::String> = None;
-  for line in text.lines() {
-    let t = line.trim();
-    for prefix in ["//# sourceMappingURL=", "//@ sourceMappingURL="] {
-      if let Some(rest) = t.strip_prefix(prefix) {
-        let url = rest.trim();
-        if !url.is_empty() {
-          found = Some(url.to_string());
-        }
-      }
-    }
-  }
-  found
-}
-
 fn compute_import_offsets(
   text: &str,
   specifiers: &[std::string::String],
@@ -2124,6 +2066,26 @@ fn compute_import_offsets(
   out
 }
 
+/// Extract the last `//# sourceMappingURL=<url>` (or legacy `//@`) magic comment
+/// from module source, mirroring V8's UnboundModuleScript::GetSourceMappingURL.
+/// V8 honours the LAST occurrence; the URL is the trimmed remainder of the line.
+/// Trailing content/blank lines after the directive are ignored (deno#21988).
+fn extract_source_mapping_url(text: &str) -> Option<std::string::String> {
+  let mut found: Option<std::string::String> = None;
+  for line in text.lines() {
+    let t = line.trim();
+    for prefix in ["//# sourceMappingURL=", "//@ sourceMappingURL="] {
+      if let Some(rest) = t.strip_prefix(prefix) {
+        let url = rest.trim();
+        if !url.is_empty() {
+          found = Some(url.to_string());
+        }
+      }
+    }
+  }
+  found
+}
+
 /// Full per-import `with { ... }` / `assert { ... }` attribute key/value pairs,
 /// parallel to `specifiers`. QuickJS's loader doesn't expose attributes through
 /// its C-ABI, so scan the clause that immediately follows each specifier literal
@@ -2133,55 +2095,65 @@ fn compute_import_attributes(
   specifiers: &[std::string::String],
 ) -> Vec<Vec<ImportAttribute>> {
   let offsets = compute_import_offsets(text, specifiers);
-  let mut out = Vec::with_capacity(specifiers.len());
-  for (i, spec) in specifiers.iter().enumerate() {
-    let mut attrs = Vec::new();
-    let off = offsets[i];
-    if off >= 0 {
-      // Position just past the specifier's closing quote.
-      let after = (off as usize + spec.len() + 2).min(text.len());
-      let tail_full = &text[after..];
-      let leading_ws = tail_full.len() - tail_full.trim_start().len();
-      let tail_start = after + leading_ws;
-      let tail = &tail_full[leading_ws..];
-      let kw = ["with", "assert"].iter().find_map(|k| {
-        tail
-          .strip_prefix(*k)
-          .filter(|rest| {
-            rest.starts_with(|c: char| c.is_whitespace() || c == '{')
-          })
-          .map(|rest| (k.len(), rest))
-      });
-      if let Some((kw_len, rest)) = kw {
-        if let Some(open) = rest.find('{') {
-          if let Some(close_rel) = rest[open + 1..].find('}') {
-            let body = &rest[open + 1..open + 1 + close_rel];
-            let body_start = tail_start + kw_len + open + 1;
-            let mut body_cursor = 0usize;
-            for pair in body.split(',') {
-              if let Some((k, v)) = pair.split_once(':') {
-                let key =
-                  k.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
-                let val =
-                  v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
-                if !key.is_empty() {
-                  let key_leading = k.len() - k.trim_start().len();
-                  let quote_offset =
-                    usize::from(k.trim_start().starts_with(['"', '\'']));
-                  let key_offset =
-                    body_start + body_cursor + key_leading + quote_offset;
-                  attrs.push((key, val, key_offset as i32));
-                }
-              }
-              body_cursor += pair.len() + 1;
+  specifiers
+    .iter()
+    .zip(offsets)
+    .map(|(spec, off)| {
+      if off >= 0 {
+        import_attributes_at(text, off as usize, spec)
+      } else {
+        Vec::new()
+      }
+    })
+    .collect()
+}
+
+/// The `with { ... }` / `assert { ... }` attributes after one specifier.
+fn import_attributes_at(
+  text: &str,
+  offset: usize,
+  spec: &str,
+) -> Vec<ImportAttribute> {
+  let mut attrs = Vec::new();
+  // Position just past the specifier's closing quote.
+  let after = (offset + spec.len() + 2).min(text.len());
+  let tail_full = &text[after..];
+  let leading_ws = tail_full.len() - tail_full.trim_start().len();
+  let tail_start = after + leading_ws;
+  let tail = &tail_full[leading_ws..];
+  let kw = ["with", "assert"].iter().find_map(|k| {
+    tail
+      .strip_prefix(*k)
+      .filter(|rest| rest.starts_with(|c: char| c.is_whitespace() || c == '{'))
+      .map(|rest| (k.len(), rest))
+  });
+  if let Some((kw_len, rest)) = kw {
+    if let Some(open) = rest.find('{') {
+      if let Some(close_rel) = rest[open + 1..].find('}') {
+        let body = &rest[open + 1..open + 1 + close_rel];
+        let body_start = tail_start + kw_len + open + 1;
+        let mut body_cursor = 0usize;
+        for pair in body.split(',') {
+          if let Some((k, v)) = pair.split_once(':') {
+            let key =
+              k.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+            let val =
+              v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+            if !key.is_empty() {
+              let key_leading = k.len() - k.trim_start().len();
+              let quote_offset =
+                usize::from(k.trim_start().starts_with(['"', '\'']));
+              let key_offset =
+                body_start + body_cursor + key_leading + quote_offset;
+              attrs.push((key, val, key_offset as i32));
             }
           }
+          body_cursor += pair.len() + 1;
         }
       }
     }
-    out.push(attrs);
   }
-  out
+  attrs
 }
 
 thread_local! {
@@ -2479,160 +2451,6 @@ fn skip_string(bytes: &[u8], i: usize, quote: u8) -> usize {
     }
   }
   n
-}
-
-fn skip_template(bytes: &[u8], i: usize) -> usize {
-  let n = bytes.len();
-  let mut j = i + 1;
-  while j < n {
-    match bytes[j] {
-      b'\\' => j += 2,
-      b'`' => return j + 1,
-      b'$' if j + 1 < n && bytes[j + 1] == b'{' => {
-        let mut depth = 1i32;
-        j += 2;
-        while j < n && depth > 0 {
-          match bytes[j] {
-            b'{' => {
-              depth += 1;
-              j += 1;
-            }
-            b'}' => {
-              depth -= 1;
-              j += 1;
-            }
-            b'"' | b'\'' => j = skip_string(bytes, j, bytes[j]),
-            b'`' => j = skip_template(bytes, j),
-            b'\\' => j += 2,
-            _ => j += 1,
-          }
-        }
-      }
-      _ => j += 1,
-    }
-  }
-  n
-}
-
-fn bare_import_well_formed(stmt: &str) -> bool {
-  let b = stmt.as_bytes();
-
-  let after_kw = match stmt.strip_prefix("import") {
-    Some(r) => r,
-    None => return false,
-  };
-  let lead_ws =
-    r#"import"#.len() + (after_kw.len() - after_kw.trim_start().len());
-  let q = match b.get(lead_ws) {
-    Some(&c) if c == b'"' || c == b'\'' => c,
-    _ => return false,
-  };
-
-  let mut j = lead_ws + 1;
-  while j < b.len() {
-    match b[j] {
-      b'\\' => j += 2,
-      c if c == q => break,
-      b'\n' => return false,
-      _ => j += 1,
-    }
-  }
-  if j >= b.len() {
-    return false;
-  }
-
-  let mut k = j + 1;
-  while k < b.len() && (b[k] == b' ' || b[k] == b'\t' || b[k] == b'\r') {
-    k += 1;
-  }
-  match b.get(k) {
-    None => true,
-    Some(&c) if c == b';' || c == b'\n' => true,
-    _ => stmt[k..].starts_with("with") || stmt[k..].starts_with("assert"),
-  }
-}
-
-fn has_balanced_quotes(s: &str) -> bool {
-  let dq = s.matches('"').count();
-  let sq = s.matches('\'').count();
-  dq % 2 == 0 && sq % 2 == 0 && (dq + sq) >= 2
-}
-
-fn extract_specifier(line: &str) -> Option<std::string::String> {
-  let scan = match find_from_specifier_start(line) {
-    Some(p) => &line[p..],
-    None => line,
-  };
-  let bytes = scan.as_bytes();
-  let mut open = None;
-  let mut q = b'"';
-  for (i, &b) in bytes.iter().enumerate() {
-    if b == b'"' || b == b'\'' {
-      open = Some(i);
-      q = b;
-      break;
-    }
-  }
-  let open = open?;
-  for i in (open + 1)..bytes.len() {
-    if bytes[i] == q {
-      return Some(scan[open + 1..i].to_string());
-    }
-  }
-  None
-}
-
-fn find_from_specifier_start(stmt: &str) -> Option<usize> {
-  let b = stmt.as_bytes();
-  let mut result = None;
-  let mut idx = 0;
-  while let Some(p) = stmt[idx..].find("from") {
-    let at = idx + p;
-    idx = at + 4;
-    let prev_ok = at == 0 || {
-      let c = b[at - 1];
-      !(c.is_ascii_alphanumeric() || c == b'_' || c == b'$')
-    };
-    let post_ident = b
-      .get(at + 4)
-      .map(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'$')
-      .unwrap_or(false);
-    let after = stmt[at + 4..].trim_start();
-    let next_quote = after.starts_with('"') || after.starts_with('\'');
-    if prev_ok && !post_ident && next_quote {
-      result = Some(at + 4);
-    }
-  }
-  result
-}
-
-fn extract_attr_type(stmt: &str) -> Option<std::string::String> {
-  let kw = stmt
-    .find(" with ")
-    .or_else(|| stmt.find(" with{"))
-    .or_else(|| stmt.find(" assert "))
-    .or_else(|| stmt.find(" assert{"))?;
-  let clause = &stmt[kw..];
-
-  let tpos = clause.find("type")?;
-  let after = &clause[tpos + 4..];
-  let bytes = after.as_bytes();
-  let mut open = None;
-  let mut q = b'"';
-  for (i, &b) in bytes.iter().enumerate() {
-    if b == b'"' || b == b'\'' {
-      open = Some(i);
-      q = b;
-      break;
-    }
-  }
-  let open = open?;
-  for i in (open + 1)..bytes.len() {
-    if bytes[i] == q {
-      return Some(after[open + 1..i].to_string());
-    }
-  }
-  None
 }
 
 fn has_top_level_await(src: &str) -> bool {
@@ -3952,11 +3770,8 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   let script_id = assign_module_script_id(&fname);
   let module_name = module_name_for_source(&fname, &text, script_id);
 
-  let import_specifiers = parse_import_specifiers(&text);
-  let spec_strs: Vec<std::string::String> =
-    import_specifiers.iter().map(|(s, _)| s.clone()).collect();
-  let import_offsets = compute_import_offsets(&text, &spec_strs);
-  let import_attributes = compute_import_attributes(&text, &spec_strs);
+  let (import_specifiers, import_offsets, import_attributes) =
+    static_import_metadata(&text);
   let is_async = has_top_level_await(&text);
 
   register_module_source(&module_name, &text);

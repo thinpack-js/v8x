@@ -187,12 +187,14 @@ dependency `crates/thinpack-jsc-rewrite`; `src/jsc/module.rs` keeps only the JSC
 calls it. The crate has no external dependencies, so the linked code is the same size class
 as the scanners it replaces, and it is unit-tested on every platform
 (`cargo test --manifest-path crates/thinpack-jsc-rewrite/Cargo.toml`). The crate is thinpack's (MIT, `LICENSE` beside it);
-it lives in this fork because the shim is its only consumer.
+it lives in this fork because the system-JSC shim and QuickJS pre-scan use it.
 
 One lexer in that crate recognizes comments, strings, template literals with nested `${}`
 expressions, regular expressions, identifiers, numbers and punctuators. Every pass uses it,
 which fixes the defects that came from scanning raw text:
 
+- QuickJS uses the same token stream to find static imports without treating regular
+  expressions as code.
 - `import.meta` is replaced only when it is the three tokens `import . meta`, not inside a
   string, template text, comment or regular expression (previously a whole-body
   `str::replace`).
