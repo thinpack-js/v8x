@@ -12,9 +12,10 @@ v8x = { git = "https://github.com/thinpack-js/v8x", rev = "<branch commit>" }
 The published crate ships the QuickJS sources already patched. A git checkout does not, so
 `build.rs` applies `patches/<engine>-NN-*.patch` onto the pinned submodule (see the
 `.git`-absent guard in `setup_vendor`); the crates.io package skips that step because it has
-no git metadata. Nothing outside `patches/quickjs-103-thinpack-startup.patch`,
-`src/jsc/`, `crates/thinpack-jsc-rewrite/` and the dependency on that crate differs from
-upstream. The submodule gitlinks are upstream's:
+no git metadata. Nothing outside `patches/`, `src/jsc/`, `src/quickjs/`,
+`vendor/temporal-polyfill/`, `tools/compress-quickjs-data.mjs`,
+`crates/thinpack-jsc-rewrite/` and their dependencies differs from upstream. The submodule
+gitlinks are upstream's:
 
 - `vendor/quickjs-ng` `034f2aba47ab6e7aacd869af7aa796b110d0ea2e` (MIT)
 - `vendor/rusty_v8` `dd1b4e9c743b7a11dbeb99d4d0dc55979218b905`
@@ -73,6 +74,29 @@ parses 50,000 declarations in about 11 ms instead of 9.95 s. Repeated names no l
 degenerate: 16,000 sibling blocks each declaring `let x` compile in 19 ms instead of 5.75 s,
 and 16,000 catch bindings in 19 ms instead of 750 ms. Ordinary minified bundles are unchanged
 (930 KB lucide: 20 ms; 3.5 MB tabler: 82 ms before, 79 ms after).
+
+## QuickJS data size
+
+The QuickJS backend stores the Temporal polyfill source and the pinned zoneinfo64 resource
+as Brotli streams in `vendor/temporal-polyfill/`. Both decode on first use. The checked-in
+`index.umd.js` remains the readable source. `zoneinfo64.res.br` is
+`src/data/zoneinfo64.res` from `zoneinfo64` 0.3.0, SHA-256
+`a24d2455af4efced6b261a2ed49da040a1e472c30899c68e7db377871db695bd`.
+`vendor/temporal-polyfill/README.md` records the provenance, and the Unicode-3.0 license
+text sits beside it. `tools/compress-quickjs-data.mjs` regenerates both streams and
+rejects a zoneinfo input whose checksum differs from the pin.
+
+`src/quickjs/string.rs` builds the en-US collator from a narrow ICU4X baked provider. The
+root collation and NFD normalization markers come from the upstream baked data;
+`CollationTailoringV1` and `CollationReorderingV1` return `IdentifierNotFound`. The string
+bridge only requests en-US, which has no tailoring or reordering, so the data the
+constructor reads is unchanged. Restore those two markers before adding locale-aware
+collation.
+
+On Linux, a QuickJS runtime built from this branch shrinks from 6,015,384 to 4,603,576
+bytes raw and from 2,541,247 to 2,204,183 bytes gzip. A packed app shrinks by the same
+1,411,808 bytes. Warm startup adds about 0.5 ms for the polyfill decode and about 0.9 ms
+when Temporal also decodes zoneinfo64.
 
 ## JSC shim changes (`src/jsc`)
 

@@ -25,45 +25,101 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
-use std::sync::OnceLock;
 
 const K_NULL_TERMINATE: int =
   crate::binding::v8_String_WriteFlags_kNullTerminate as int;
 const K_MAX_STRING_LENGTH: usize =
   crate::binding::v8__String__kMaxLength as usize;
 
+// The bridge requests only en-US, with or without numeric sorting. Keep the
+// root collation and normalization data, but do not link the per-locale
+// tailorings and reordering tables that en-US never requests.
+mod en_us {
+  use icu_collator::provider::*;
+  use icu_normalizer::provider::{NormalizerNfdDataV1, NormalizerNfdTablesV1};
+  use icu_provider::prelude::*;
+
+  pub(super) struct Provider;
+
+  macro_rules! provide {
+    ($source:expr; $($marker:ty),+ $(,)?) => {
+      $(
+        impl DataProvider<$marker> for Provider {
+          fn load(
+            &self,
+            req: DataRequest,
+          ) -> Result<DataResponse<$marker>, DataError> {
+            DataProvider::<$marker>::load(&$source, req)
+          }
+        }
+      )+
+    };
+  }
+
+  provide!(
+    Baked;
+    CollationSpecialPrimariesV1,
+    CollationRootV1,
+    CollationDiacriticsV1,
+    CollationJamoV1,
+    CollationMetadataV1,
+  );
+  provide!(
+    icu_normalizer::provider::Baked;
+    NormalizerNfdDataV1,
+    NormalizerNfdTablesV1,
+  );
+
+  macro_rules! absent {
+    ($($marker:ty),+ $(,)?) => {
+      $(
+        impl DataProvider<$marker> for Provider {
+          fn load(
+            &self,
+            req: DataRequest,
+          ) -> Result<DataResponse<$marker>, DataError> {
+            Err(DataErrorKind::IdentifierNotFound.with_req(<$marker>::INFO, req))
+          }
+        }
+      )+
+    };
+  }
+
+  absent!(CollationTailoringV1, CollationReorderingV1);
+}
+
+fn build_collator(numeric: bool) -> Option<icu_collator::Collator> {
+  let mut preferences: icu_collator::CollatorPreferences =
+    icu_locale::locale!("en-US").into();
+  if numeric {
+    preferences.numeric_ordering =
+      Some(icu_collator::preferences::CollationNumericOrdering::True);
+  }
+  icu_collator::Collator::try_new_unstable(
+    &en_us::Provider,
+    preferences,
+    Default::default(),
+  )
+  .ok()
+}
+
 fn locale_compare(
   left: &str,
   right: &str,
   numeric: bool,
 ) -> std::cmp::Ordering {
-  static DEFAULT_COLLATOR: OnceLock<
-    Option<icu_collator::CollatorBorrowed<'static>>,
-  > = OnceLock::new();
-  static NUMERIC_COLLATOR: OnceLock<
-    Option<icu_collator::CollatorBorrowed<'static>>,
-  > = OnceLock::new();
-  let collator = if numeric {
-    NUMERIC_COLLATOR.get_or_init(|| {
-      let mut preferences: icu_collator::CollatorPreferences =
-        icu_locale::locale!("en-US").into();
-      preferences.numeric_ordering =
-        Some(icu_collator::preferences::CollationNumericOrdering::True);
-      icu_collator::Collator::try_new(preferences, Default::default()).ok()
-    })
-  } else {
-    DEFAULT_COLLATOR.get_or_init(|| {
-      icu_collator::Collator::try_new(
-        icu_locale::locale!("en-US").into(),
-        Default::default(),
-      )
-      .ok()
-    })
-  };
-  collator
-    .as_ref()
-    .map(|collator| collator.compare(left, right))
-    .unwrap_or_else(|| left.cmp(right))
+  // The owned collator is not Send/Sync, so keep one per thread.
+  thread_local! {
+    static DEFAULT: Option<icu_collator::Collator> = build_collator(false);
+    static NUMERIC: Option<icu_collator::Collator> = build_collator(true);
+  }
+  let slot = if numeric { &NUMERIC } else { &DEFAULT };
+  slot.with(|collator| {
+    collator
+      .as_ref()
+      .map(|collator| collator.as_borrowed().compare(left, right))
+      .unwrap_or_else(|| left.cmp(right))
+  })
 }
 
 #[unsafe(no_mangle)]
